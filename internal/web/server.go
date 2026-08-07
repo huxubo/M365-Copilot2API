@@ -167,6 +167,12 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 		}
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
 			if !s.validAPIKey(r) {
+				// /v1/models GET 为纯本地目录查询（不触达上游），允许已登录管理员访问，
+				// 以便模型测试页在 key 哈希持久化（前端拿不到明文 key）后仍能列出模型。
+				if r.URL.Path == "/v1/models" && r.Method == http.MethodGet && s.validAdminSession(r) {
+					next.ServeHTTP(w, r)
+					return
+				}
 				http.Error(w, `{"error":{"message":"valid API key required","type":"auth_error"}}`, http.StatusUnauthorized)
 				return
 			}
