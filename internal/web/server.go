@@ -48,8 +48,15 @@ type Server struct {
 	debug               *debugStore
 	settings            *settingsStore
 	responseMu          sync.Mutex
-	responseMessages    map[string][]oaiMsg
+	responseMessages    map[string]map[string]respHistory
 	usage               *usageLog
+}
+
+const maxResponsesPerTenant = 256
+
+type respHistory struct {
+	At       time.Time
+	Messages []oaiMsg
 }
 
 func New() (*Server, error) {
@@ -76,15 +83,15 @@ func New() (*Server, error) {
 		userSessions:        openUserSessionStore(sessionTTL),
 		sessionResolver:     openSessionResolver(),
 		conversationManager: openConversationManager(),
-		adminPassword:      password,
-		adminSessions:      map[string]time.Time{},
-		mustChangePassword: mustChange,
-		loginAttempts:      map[string]loginAttempt{},
-		apiKeys:            openAPIKeys(),
-		debug:              openDebugStore(),
-		settings:           openSettingsStore(),
-		responseMessages:   map[string][]oaiMsg{},
-		usage:              openUsageLog(),
+		adminPassword:       password,
+		adminSessions:       map[string]time.Time{},
+		mustChangePassword:  mustChange,
+		loginAttempts:       map[string]loginAttempt{},
+		apiKeys:             openAPIKeys(),
+		debug:               openDebugStore(),
+		settings:            openSettingsStore(),
+		responseMessages:    map[string]map[string]respHistory{},
+		usage:               openUsageLog(),
 	}, nil
 }
 
@@ -149,12 +156,12 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/v1/messages", s.anthropicMessages)
 	m.HandleFunc("/v1/images/generations", s.imageGenerations)
 	m.HandleFunc("/", s.rootPage)
-	return requestID(httpTrace(securityHeaders(s.adminMiddleware(s.debugMiddleware(m)))))
+	return recoverPanics(requestID(httpTrace(securityHeaders(s.adminMiddleware(s.debugMiddleware(m))))))
 }
 
 func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/" || r.URL.Path == "/login" || r.URL.Path == "/api/stats" || r.URL.Path == "/api/stats/reset" {
+		if r.URL.Path == "/api/admin/login" || r.URL.Path == "/api/admin/session" || r.URL.Path == "/api/admin/change-password" || r.URL.Path == "/api/admin/logout" || r.URL.Path == "/" || r.URL.Path == "/login" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -209,6 +216,17 @@ func (s *Server) validAdminSession(r *http.Request) bool {
 	return true
 }
 
+const maxAdminSessions = 4096
+
+// pruneAdminSessions drops expired entries; callers must hold s.mu.
+func pruneAdminSessions(m map[string]time.Time, now time.Time) {
+	for k, exp := range m {
+		if now.After(exp) {
+			delete(m, k)
+		}
+	}
+}
+
 func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
@@ -242,7 +260,19 @@ func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	token := base64.RawURLEncoding.EncodeToString(b)
 	s.mu.Lock()
-	s.adminSessions[token] = time.Now().Add(24 * time.Hour)
+	pruneAdminSessions(s.adminSessions, now)
+	if len(s.adminSessions) >= maxAdminSessions {
+		// Evict the oldest entry to keep the map bounded.
+		var oldest string
+		var oldestExp time.Time
+		for k, exp := range s.adminSessions {
+			if oldest == "" || exp.Before(oldestExp) {
+				oldest, oldestExp = k, exp
+			}
+		}
+		delete(s.adminSessions, oldest)
+	}
+	s.adminSessions[token] = now.Add(24 * time.Hour)
 	s.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: "m365_admin_session", Value: token, Path: "/", HttpOnly: true, Secure: secureAdminCookie(r), SameSite: http.SameSiteLaxMode, MaxAge: 86400})
 	jsonOut(w, map[string]any{"status": "authenticated", "must_change_password": mustChange})
@@ -602,10 +632,6 @@ func modelTone(model string) string {
 		return "Gpt_5_4_Chat"
 	case "gpt-5.3-think-deeper":
 		return "Gpt_5_3_Chat"
-	case "quick":
-		return "Gpt_Quick"
-	case "think-deeper":
-		return "Gpt_Reasoning"
 	default:
 		return "magic"
 	}
@@ -617,6 +643,7 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body chatBody
+	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
@@ -959,9 +986,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		var pending strings.Builder
 		var streamedTools []detectedToolCall
 		first := true
-		emitText := func(part string) {
+		emitText := func(part string) error {
 			if part == "" {
-				return
+				return nil
+			}
+			if err := r.Context().Err(); err != nil {
+				return err
 			}
 			delta := map[string]any{"content": part}
 			if first {
@@ -969,47 +999,54 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				first = false
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}}
-			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk)); err != nil {
+				return err
+			}
 			flusher.Flush()
+			return nil
 		}
 		res, err := s.chat.ChatWithEvents(ctx, account, answerReq, func(ev chathub.StreamEvent) error {
-		    if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
-		     streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
-		     return nil
-		    }
-		    if ev.Kind != "text" || ev.Text == "" {
-		     return nil
-		    }
-		    text.WriteString(ev.Text)
-		    pending.WriteString(ev.Text)
-		    v := pending.String()
-		    // If the text contains a bash block or a JSON command, don't emit it as text
-		    // It will be caught by fencedToolCalls after the stream completes
-		    if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
-		     return nil
-		    }
-		    if i := strings.Index(v, "```"); i >= 0 {
-		     emitText(v[:i])
-		     pending.Reset()
-		     pending.WriteString(v[i:])
-		     return nil
-		    }
-		    if runeCount := utf8.RuneCountInString(v); runeCount > 8 {
-		     cut := 0
-		     seen := 0
-		     for i := range v {
-		      if seen == runeCount-8 {
-		       cut = i
-		       break
-		      }
-		      seen++
-		     }
-		     emitText(v[:cut])
-		     pending.Reset()
-		     pending.WriteString(v[cut:])
-		    }
-		    return nil
-		   })
+			if ev.Kind == "tool" && ev.ToolName != "" && len(ev.Arguments) > 0 {
+				streamedTools = append(streamedTools, detectedToolCall{ID: "call_" + uuid.NewString(), Name: ev.ToolName, Arguments: ev.Arguments})
+				return nil
+			}
+			if ev.Kind != "text" || ev.Text == "" {
+				return nil
+			}
+			text.WriteString(ev.Text)
+			pending.WriteString(ev.Text)
+			v := pending.String()
+			// If the text contains a bash block or a JSON command, don't emit it as text
+			// It will be caught by fencedToolCalls after the stream completes
+			if strings.Contains(v, "```bash") || strings.Contains(v, "\"command\"") {
+				return nil
+			}
+			if i := strings.Index(v, "```"); i >= 0 {
+				if err := emitText(v[:i]); err != nil {
+					return err
+				}
+				pending.Reset()
+				pending.WriteString(v[i:])
+				return nil
+			}
+			if runeCount := utf8.RuneCountInString(v); runeCount > 8 {
+				cut := 0
+				seen := 0
+				for i := range v {
+					if seen == runeCount-8 {
+						cut = i
+						break
+					}
+					seen++
+				}
+				if err := emitText(v[:cut]); err != nil {
+					return err
+				}
+				pending.Reset()
+				pending.WriteString(v[cut:])
+			}
+			return nil
+		})
 		if err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			fmt.Fprint(w, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": upstreamError(err)}})+"\n\n")
@@ -1037,7 +1074,10 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
 			return
 		}
-		emitText(pending.String())
+		if err := emitText(pending.String()); err != nil {
+			log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
+			return
+		}
 		fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		if body.User != "" && res.ConversationID != "" {
@@ -1124,22 +1164,44 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		id := "chatcmpl-" + uuid.NewString()
 		model := firstNonEmpty(body.Model, "m365-copilot")
 		firstDelta := true
-		emit := func(content string) error {
-			delta := map[string]any{"content": content}
+		writeChunk := func(delta map[string]any) error {
+			if err := r.Context().Err(); err != nil {
+				return err
+			}
+			// The first SSE chunk must carry the assistant role; subsequent
+			// chunks carry content or reasoning deltas.
 			if firstDelta {
 				firstDelta = false
-				delta = map[string]any{"content": nil, "reasoning_content": "正在分析请求并准备回答……"}
+				withRole := map[string]any{"role": "assistant", "content": nil}
+				for k, v := range delta {
+					withRole[k] = v
+				}
+				delta = withRole
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": delta}}}
-			fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk))
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk)); err != nil {
+				return err
+			}
 			flusher.Flush()
+			return nil
+		}
+		onDelta := func(content string) error {
+			if content != "" {
+				return writeChunk(map[string]any{"content": content})
+			}
+			return nil
+		}
+		onReasoning := func(reasoning string) error {
+			if reasoning != "" {
+				return writeChunk(map[string]any{"reasoning_content": reasoning})
+			}
 			return nil
 		}
 		// Commit headers immediately; the first upstream delta is then forwarded
 		// without waiting for the full ChatHub completion frame.
 		fmt.Fprintf(w, ": connected\n\n")
 		flusher.Flush()
-		res, err = s.chat.ChatWithDelta(ctx, account, answerReq, emit)
+		res, err = s.chat.ChatWithReasoning(ctx, account, answerReq, onDelta, onReasoning)
 		if err == nil {
 			fmt.Fprint(w, "data: [DONE]\n\n")
 			flusher.Flush()
@@ -1264,6 +1326,13 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		}
 		content = parts
 	}
+	assistant := map[string]any{
+		"role":    "assistant",
+		"content": content,
+	}
+	if res.Reasoning != "" {
+		assistant["reasoning_content"] = res.Reasoning
+	}
 	// 上游 ChatHub 不返回 token 计数，按请求/回复文本本地估算填充
 	// OpenAI 要求的 usage 字段。
 	pt := EstimateTokens(prompt)
@@ -1274,14 +1343,11 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		"created": created,
 		"model":   model,
 		"choices": []map[string]any{{
-			"index": 0,
-			"message": map[string]any{
-				"role":    "assistant",
-				"content": content,
-			},
+			"index":         0,
+			"message":       assistant,
 			"finish_reason": "stop",
 		}},
-		"m365":  compatM365Metadata(res),
+		"m365": compatM365Metadata(res),
 		"usage": map[string]any{
 			"prompt_tokens":     pt,
 			"completion_tokens": ct,

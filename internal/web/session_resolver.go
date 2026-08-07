@@ -1,4 +1,4 @@
-﻿package web
+package web
 
 import (
 	"crypto/sha256"
@@ -43,7 +43,11 @@ type sessionResolver struct {
 	byContext   map[string]string // contextFingerprint -> sessionID
 	ttl         time.Duration
 	contextTTL  time.Duration
+	maxSessions int
+	persist     *persistStore
 }
+
+const defaultMaxSessions = 1000
 
 func openSessionResolver() *sessionResolver {
 	// 闂茬疆 2 灏忔椂鍗宠涓鸿繃鏈燂紙鐢ㄦ埛锛? 灏忔椂涓嶆椿璺冨凡缁忕畻涔咃級銆備細璇濊繃鏈熷悗
@@ -73,7 +77,9 @@ func openSessionResolver() *sessionResolver {
 		byContext:   map[string]string{},
 		ttl:         ttl,
 		contextTTL:  contextTTL,
+		maxSessions: defaultMaxSessions,
 	}
+	sr.persist = &persistStore{flush: sr.flush}
 	sr.loadLocked()
 	return sr
 }
@@ -93,13 +99,19 @@ func (sr *sessionResolver) loadLocked() {
 	}
 }
 
-func (sr *sessionResolver) saveLocked() {
+// flush 在锁内生成快照，锁外写盘。
+func (sr *sessionResolver) flush() error {
+	sr.mu.Lock()
 	list := make([]sessionBinding, 0, len(sr.sessions))
 	for _, s := range sr.sessions {
 		list = append(list, s)
 	}
-	b, _ := json.MarshalIndent(list, "", "  ")
-	_ = os.WriteFile(sr.path, b, 0o600)
+	b, err := json.MarshalIndent(list, "", "  ")
+	sr.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(sr.path, b, 0o600)
 }
 
 func (sr *sessionResolver) reindexLocked(s sessionBinding) {
@@ -119,17 +131,34 @@ func (sr *sessionResolver) evictLocked() {
 	now := time.Now().UTC()
 	for id, s := range sr.sessions {
 		if now.Sub(s.LastUsedAt) > sr.ttl {
-			delete(sr.sessions, id)
-			if sr.byUserField[s.UserField] == id {
-				delete(sr.byUserField, s.UserField)
-			}
-			if sr.byIPFinger[s.IPFingerprint] == id {
-				delete(sr.byIPFinger, s.IPFingerprint)
-			}
-			if sr.byContext[s.ContextFinger] == id {
-				delete(sr.byContext, s.ContextFinger)
-			}
+			sr.dropLocked(id, s)
 		}
+	}
+	if len(sr.sessions) > sr.maxSessions {
+		// Bound memory by dropping the least recently used sessions.
+		ids := make([]string, 0, len(sr.sessions))
+		last := make(map[string]time.Time, len(sr.sessions))
+		for id, s := range sr.sessions {
+			ids = append(ids, id)
+			last[id] = s.LastUsedAt
+		}
+		sort.Slice(ids, func(i, j int) bool { return last[ids[i]].Before(last[ids[j]]) })
+		for _, id := range ids[:len(sr.sessions)-sr.maxSessions] {
+			sr.dropLocked(id, sr.sessions[id])
+		}
+	}
+}
+
+func (sr *sessionResolver) dropLocked(id string, s sessionBinding) {
+	delete(sr.sessions, id)
+	if sr.byUserField[s.UserField] == id {
+		delete(sr.byUserField, s.UserField)
+	}
+	if sr.byIPFinger[s.IPFingerprint] == id {
+		delete(sr.byIPFinger, s.IPFingerprint)
+	}
+	if sr.byContext[s.ContextFinger] == id {
+		delete(sr.byContext, s.ContextFinger)
 	}
 }
 
@@ -229,23 +258,23 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 	if explicitID != "" {
 		if sessID, ok := sr.byExplicit[explicitID]; ok {
 			if sess, ok := sr.sessions[sessID]; ok {
-				sess.LastUsedAt = time.Now().UTC()
-				sr.sessions[sessID] = sess
-				sr.saveLocked()
-				return ResolveResult{
-					SessionID:      sess.SessionID,
-					ConversationID: sess.ConversationID,
-					AccountID:      sess.AccountID,
-					MatchedBy:      "explicit",
-					IsNew:          false,
-					HistoryLen:     len(sess.ContextHistory),
-				}
+			sess.LastUsedAt = time.Now().UTC()
+			sr.sessions[sessID] = sess
+			sr.persist.markDirty()
+			return ResolveResult{
+				SessionID:      sess.SessionID,
+				ConversationID: sess.ConversationID,
+				AccountID:      sess.AccountID,
+				MatchedBy:      "explicit",
+				IsNew:          false,
+				HistoryLen:     len(sess.ContextHistory),
+			}
 			}
 		}
 		if sess, ok := sr.sessions[explicitID]; ok {
 			sess.LastUsedAt = time.Now().UTC()
 			sr.sessions[explicitID] = sess
-			sr.saveLocked()
+			sr.persist.markDirty()
 			return ResolveResult{
 				SessionID:      sess.SessionID,
 				ConversationID: sess.ConversationID,
@@ -265,7 +294,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		sess := sr.sessions[bestID]
 		sess.LastUsedAt = time.Now().UTC()
 		sr.sessions[bestID] = sess
-		sr.saveLocked()
+		sr.persist.markDirty()
 		return ResolveResult{
 			SessionID:      sess.SessionID,
 			ConversationID: sess.ConversationID,
@@ -308,7 +337,7 @@ func (sr *sessionResolver) Resolve(r *http.Request, body *oaiReq) ResolveResult 
 		sess := sr.sessions[bestMatchID]
 		sess.LastUsedAt = time.Now().UTC()
 		sr.sessions[bestMatchID] = sess
-		sr.saveLocked()
+		sr.persist.markDirty()
 		return ResolveResult{
 			SessionID:      sess.SessionID,
 			ConversationID: sess.ConversationID,
@@ -406,6 +435,7 @@ func toolCallEqual(x, y map[string]any) bool {
 func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, body *oaiReq, r *http.Request) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
+	sr.evictLocked()
 
 	now := time.Now().UTC()
 	explicitID := r.Header.Get("X-M365-Session-Id")
@@ -425,7 +455,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 			sess.ContextHistory = cloneMessages(body.Messages)
 			sr.sessions[sessionID] = sess
 			sr.reindexLocked(sess)
-			sr.saveLocked()
+			sr.persist.markDirty()
 			return
 		}
 	}
@@ -440,7 +470,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 				sess.ContextHistory = cloneMessages(body.Messages)
 				sr.sessions[sid] = sess
 				sr.reindexLocked(sess)
-				sr.saveLocked()
+				sr.persist.markDirty()
 				return
 			}
 		}
@@ -460,7 +490,7 @@ func (sr *sessionResolver) Bind(sessionID, conversationID, accountID string, bod
 	}
 
 	sr.reindexLocked(sess)
-	sr.saveLocked()
+	sr.persist.markDirty()
 }
 
 func (sr *sessionResolver) GetSession(sessionID string) (sessionBinding, bool) {
@@ -501,7 +531,7 @@ func (sr *sessionResolver) DeleteSession(sessionID string) bool {
 	if s.ContextFinger != "" {
 		delete(sr.byContext, s.ContextFinger)
 	}
-	sr.saveLocked()
+	sr.persist.markDirty()
 	return true
 }
 
@@ -530,7 +560,7 @@ func (sr *sessionResolver) UnbindByConversation(conversationID string) int {
 		removed++
 	}
 	if removed > 0 {
-		sr.saveLocked()
+		sr.persist.markDirty()
 	}
 	return removed
 }

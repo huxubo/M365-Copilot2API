@@ -30,6 +30,10 @@ const (
 	rs          = "\x1e"
 	defaultTone = "magic"
 	wsBase      = "wss://substrate.office.com/m365Copilot/Chathub"
+	// maxAttachments bounds per-request remote downloads: each image is
+	// base64-encoded and held in memory alongside the multipart body.
+	maxAttachments   = 10
+	maxAttachmentMiB = 10
 )
 
 // Variants mirrored from the verified browser / Python probe.
@@ -71,6 +75,7 @@ type StreamHandler func(StreamEvent) error
 
 type Result struct {
 	Text           string
+	Reasoning      string
 	ConversationID string
 	SessionID      string
 	RequestID      string
@@ -123,6 +128,19 @@ func (c *Client) ChatWithEvents(ctx context.Context, acc Account, req Request, h
 // reconstruction but are not emitted as deltas, preventing duplicate text.
 func (c *Client) ChatWithDelta(ctx context.Context, acc Account, req Request, onDelta func(string) error) (Result, error) {
 	return c.chatWithHandlers(ctx, acc, req, onDelta, nil)
+}
+
+// ChatWithReasoning is the streaming entry point used by the OpenAI-compatible
+// layer. onDelta receives answer text tokens, onReasoning receives the
+// multi-step ChainOfThought transcript that ChatHub marks with
+// contentOrigin=ChainOfThoughtSummary / addToChainOfThought=true.
+func (c *Client) ChatWithReasoning(ctx context.Context, acc Account, req Request, onDelta func(string) error, onReasoning func(string) error) (Result, error) {
+	return c.chatWithHandlers(ctx, acc, req, onDelta, func(ev StreamEvent) error {
+		if ev.Kind == "reasoning" && ev.Text != "" && onReasoning != nil {
+			return onReasoning(ev.Text)
+		}
+		return nil
+	})
 }
 
 func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request, onDelta func(string) error, onEvent StreamHandler) (Result, error) {
@@ -190,15 +208,15 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	}
 
 	var deltas []string
-	var streamedText string
+	var streamed strings.Builder
 	emitDelta := func(d string) error {
 		if d == "" {
 			return nil
 		}
-		if streamedText == "" {
+		if streamed.Len() == 0 {
 			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(d))
 		}
-		streamedText += d
+		streamed.WriteString(d)
 		deltas = append(deltas, d)
 		if onDelta != nil {
 			return onDelta(d)
@@ -213,17 +231,18 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if snapshot == "" {
 			return nil
 		}
-		if streamedText == "" {
+		cur := streamed.String()
+		if cur == "" {
 			return emitDelta(snapshot)
 		}
-		if strings.HasPrefix(snapshot, streamedText) {
-			return emitDelta(strings.TrimPrefix(snapshot, streamedText))
+		if strings.HasPrefix(snapshot, cur) {
+			return emitDelta(strings.TrimPrefix(snapshot, cur))
 		}
-		if i := strings.Index(snapshot, streamedText); i >= 0 {
-			return emitDelta(snapshot[i+len(streamedText):])
+		if i := strings.Index(snapshot, cur); i >= 0 {
+			return emitDelta(snapshot[i+len(cur):])
 		}
-		if len(snapshot) > len(streamedText) && strings.HasSuffix(snapshot, streamedText) {
-			return emitDelta(snapshot[:len(snapshot)-len(streamedText)])
+		if len(snapshot) > len(cur) && strings.HasSuffix(snapshot, cur) {
+			return emitDelta(snapshot[:len(snapshot)-len(cur)])
 		}
 		return emitDelta(snapshot)
 	}
@@ -232,22 +251,33 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	var rawResult string
 	var events []json.RawMessage
 	seenStreamTools := map[string]bool{}
+	var reasoningBuf strings.Builder
 
 	deadline := time.Now().Add(5 * time.Minute)
+	type wsRead struct {
+		msg []byte
+		err error
+	}
 	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		// ReadMessage 阻塞期间无法响应 ctx 取消，放入独立 goroutine 由 select 联动。
+		readCh := make(chan wsRead, 1)
+		go func() {
+			_, msg, err := conn.ReadMessage()
+			readCh <- wsRead{msg: msg, err: err}
+		}()
+		var read wsRead
 		select {
 		case <-ctx.Done():
 			return Result{}, ctx.Err()
-		default:
+		case read = <-readCh:
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
+		if read.err != nil {
 			// Never convert a timeout or dropped WebSocket into a successful
 			// partial response. A response is complete only after SignalR type 3.
-			return Result{}, fmt.Errorf("ws read before completion: %w", err)
+			return Result{}, fmt.Errorf("ws read before completion: %w", read.err)
 		}
-		for _, part := range strings.Split(string(msg), rs) {
+		for _, part := range strings.Split(string(read.msg), rs) {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
@@ -280,13 +310,16 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 								return Result{}, err
 							}
 						}
+					}
 
-						for _, ev := range classifyUpdateMessages(msgs) {
-							ev.Raw = eventRaw(arg)
-							if ev.Kind != "text" {
-								if err := onEvent(ev); err != nil {
-									return Result{}, err
-								}
+					for _, ev := range classifyUpdateMessages(msgs) {
+						if ev.Kind == "reasoning" {
+							reasoningBuf.WriteString(ev.Text)
+						}
+						ev.Raw = eventRaw(arg)
+						if ev.Kind != "text" && onEvent != nil {
+							if err := onEvent(ev); err != nil {
+								return Result{}, err
 							}
 						}
 					}
@@ -351,13 +384,14 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
 				}
 				// end of stream
-				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), len(streamedText), len(events))
+				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), streamed.Len(), len(events))
 				text := final
 				if text == "" {
 					text = strings.Join(deltas, "")
 				}
 				return Result{
 					Text:           text,
+					Reasoning:      reasoningBuf.String(),
 					ConversationID: req.ConversationID,
 					SessionID:      req.SessionID,
 					RequestID:      requestID,
@@ -400,14 +434,22 @@ func buildWSURL(acc Account, sessionID, conversationID, requestID string) (strin
 }
 
 func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversationID string, attachments []Attachment) error {
+	imageCount := 0
 	for i := range attachments {
 		a := &attachments[i]
 		if a.Type != "image" {
 			continue
 		}
+		imageCount++
+		if imageCount > maxAttachments {
+			return fmt.Errorf("too many image attachments: limit is %d", maxAttachments)
+		}
 		// For non-data URLs, download the image first
 		imageData := a.URL
 		if !strings.HasPrefix(a.URL, "data:") {
+			if err := validateRemoteDownloadURL(a.URL); err != nil {
+				return err
+			}
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
 			if err != nil {
 				continue
@@ -416,7 +458,7 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 			if err != nil {
 				continue
 			}
-			body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxAttachmentMiB<<20))
 			resp.Body.Close()
 			if err != nil || resp.StatusCode != http.StatusOK {
 				continue
