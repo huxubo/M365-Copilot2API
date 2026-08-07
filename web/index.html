@@ -1228,7 +1228,6 @@ async function loadModelTest(){
   }catch(e){$('modelTestRows').innerHTML=`<tr><td colspan="4" class="empty">${e.message}</td></tr>`;}
 }
 async function modelTestOne(id,row){
-  if(!modelTestKey){showNotice('测试模型需要 API Key：请先在「密钥管理」新建一个 Key 后再测试','error');return;}
   const badge=row.querySelector('td:nth-child(2)');
   const lat=row.querySelector('td:nth-child(3)');
   const reply=row.querySelector('td:nth-child(4)');
@@ -1236,7 +1235,8 @@ async function modelTestOne(id,row){
   lat.textContent='-';reply.textContent='';
   const start=performance.now();
   try{
-    const d=await api('/v1/chat/completions',{method:'POST',headers:{Authorization:'Bearer '+modelTestKey},body:JSON.stringify({model:id,messages:[{role:'user',content:'Say "OK" in one word.'}]})});
+    const hdrs=modelTestKey?{Authorization:'Bearer '+modelTestKey}:{};
+    const d=await api('/v1/chat/completions',{method:'POST',headers:hdrs,body:JSON.stringify({model:id,messages:[{role:'user',content:'Say "OK" in one word.'}]})});
     const ms=Math.round(performance.now()-start);
     const content=d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content;
     badge.innerHTML='<span class="status online"><i></i>正常</span>';

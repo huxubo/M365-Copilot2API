@@ -167,9 +167,10 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 		}
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
 			if !s.validAPIKey(r) {
-				// /v1/models GET 为纯本地目录查询（不触达上游），允许已登录管理员访问，
-				// 以便模型测试页在 key 哈希持久化（前端拿不到明文 key）后仍能列出模型。
-				if r.URL.Path == "/v1/models" && r.Method == http.MethodGet && s.validAdminSession(r) {
+				// 管理控制台操作（模型测试等）允许已登录管理员直连：
+				// /v1/models GET 为纯本地目录查询；/v1/chat/completions POST
+				// 用于模型测试（key 哈希持久化后前端无明文可用）。
+				if s.validAdminSession(r) && ((r.URL.Path == "/v1/models" && r.Method == http.MethodGet) || (r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost)) {
 					next.ServeHTTP(w, r)
 					return
 				}
