@@ -25,6 +25,28 @@ M365 Copilot2API 是一个用 Go 编写的自托管网关，把微软 365 Copilo
 > - 本项目**仅供个人学习与研究**，**禁止用于商业转售或规模化运营**。
 > - 账号被封禁、数据丢失等任何损失，本项目维护者与贡献者**概不负责**。
 
+## 界面预览
+
+<p align="center"><img src="docs/screenshots/02-dashboard.png" alt="仪表盘" style="max-width:860px;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.18)"></p>
+
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="docs/screenshots/01-login.png" alt="登录页" style="border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.12)"><br><sub><b>登录</b></sub></td>
+    <td align="center" width="33%"><img src="docs/screenshots/03-usage.png" alt="用量统计" style="border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.12)"><br><sub><b>用量统计</b></sub></td>
+    <td align="center" width="33%"><img src="docs/screenshots/04-accounts.png" alt="账号管理" style="border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.12)"><br><sub><b>账号管理</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><img src="docs/screenshots/05-apikeys.png" alt="API Keys" style="border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.12)"><br><sub><b>API Keys</b></sub></td>
+    <td align="center" width="33%"><img src="docs/screenshots/06-conversations.png" alt="对话管理" style="border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.12)"><br><sub><b>对话管理</b></sub></td>
+    <td align="center" width="33%"><img src="docs/screenshots/07-proxies.png" alt="代理池" style="border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.12)"><br><sub><b>代理池</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><img src="docs/screenshots/08-modeltest.png" alt="模型测试" style="border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.12)"><br><sub><b>模型测试</b></sub></td>
+    <td align="center" width="33%"><img src="docs/screenshots/09-settings.png" alt="设置" style="border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.12)"><br><sub><b>设置</b></sub></td>
+    <td align="center" width="33%"><sub><i>更多功能，等你发现</i></sub></td>
+  </tr>
+</table>
+
 ## 功能特性
 
 | 功能 | 说明 |
@@ -262,6 +284,8 @@ curl http://127.0.0.1:4141/v1/messages \
   -d '{"model":"gpt-5.6-sol","max_tokens":1024,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
+上游返回的推理内容（ChainOfThought）会映射为 Anthropic `thinking` block，Claude Code 中可正常显示与使用。
+
 ## 对接 Claude Code
 
 在 `~/.claude/settings.json` 的 `env` 中指向网关：
@@ -277,6 +301,8 @@ curl http://127.0.0.1:4141/v1/messages \
 ```
 
 其他任何支持 OpenAI / Anthropic `base_url` 配置的客户端（OpenCode、Cursor、Codex 等）同理，把 `BASE_URL` 指向网关即可。
+
+控制台「API Keys」页的「使用 API 密钥」弹窗可直接生成 Claude Code 的 `settings.json` 配置与终端环境变量，复制即可。
 
 > ⚠️ **认证冲突提醒**：如果系统环境变量残留了 `ANTHROPIC_API_KEY`，或同时配置了 `ANTHROPIC_AUTH_TOKEN`，Claude Code 会告警「认证可能不工作」。请二选一：让 `settings.json` 的 `env` 覆盖系统级变量，或删除系统级 `ANTHROPIC_*`。
 
@@ -347,6 +373,7 @@ curl http://127.0.0.1:4141/v1/messages \
 | `/api/admin/login` · `/logout` · `/session` | 管理端登录态 |
 | `/api/admin/change-password` | 修改管理员密码（首次登录强制） |
 | `/api/admin/keys` | API Key 管理（创建 / 撤销 / 回读） |
+| `/api/admin/models` · `/models/test` | 模型目录 / 单模型连通测试（不依赖明文 Key） |
 | `/api/admin/settings` | 运行时设置查看与修改 |
 | `/api/admin/proxy-pool` | 代理池管理 |
 | `/api/accounts` · `/refresh` · `/delete` | 账号管理 |

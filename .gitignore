@@ -46,3 +46,6 @@ data-live-backup*/
 
 # Local agent memory (machine-specific notes)
 AGENTS.md
+
+# WIP build during this session
+/m365-copilot2api.new*

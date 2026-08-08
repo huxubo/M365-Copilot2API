@@ -119,6 +119,8 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/admin/session", s.adminSession)
 	m.HandleFunc("/api/admin/change-password", s.adminChangePassword)
 	m.HandleFunc("/api/admin/keys", s.adminKeys)
+	m.HandleFunc("/api/admin/models", s.adminModels)
+	m.HandleFunc("/api/admin/models/test", s.adminModelTest)
 	m.HandleFunc("/api/admin/settings", s.adminSettings)
 	m.HandleFunc("/api/admin/proxy-pool", s.proxyPool)
 	m.HandleFunc("/api/admin/deployments", s.deployments)
@@ -167,13 +169,6 @@ func (s *Server) adminMiddleware(next http.Handler) http.Handler {
 		}
 		if strings.HasPrefix(r.URL.Path, "/v1/") {
 			if !s.validAPIKey(r) {
-				// 管理控制台操作（模型测试等）允许已登录管理员直连：
-				// /v1/models GET 为纯本地目录查询；/v1/chat/completions POST
-				// 用于模型测试（key 哈希持久化后前端无明文可用）。
-				if s.validAdminSession(r) && ((r.URL.Path == "/v1/models" && r.Method == http.MethodGet) || (r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost)) {
-					next.ServeHTTP(w, r)
-					return
-				}
 				http.Error(w, `{"error":{"message":"valid API key required","type":"auth_error"}}`, http.StatusUnauthorized)
 				return
 			}
@@ -733,6 +728,71 @@ func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// dropTransientConversation 异步删除 router/repair 轮创建的一次性云端对话，
+// 避免每请求都往 M365 对话列表塞一条记录。删除失败不阻塞请求，留给 auto_cleanup 兜底。
+func (s *Server) dropTransientConversation(conversationID string) {
+	if conversationID == "" || m365CloudClient == nil {
+		return
+	}
+	go func(id string) {
+		if err := m365CloudClient.DeleteConversation(id); err != nil {
+			log.Printf("[transient-conv] delete failed id=%s err=%v", id, err)
+		}
+	}(conversationID)
+}
+
+func (s *Server) adminModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	jsonOut(w, map[string]any{"object": "list", "data": modelCatalog()})
+}
+
+// adminModelTest 由控制台模型测试调用，通过管理员会话鉴权，不依赖明文 API Key
+// （密钥加固后 list 不再返回 raw，前端无法再自行携带 key 调用 /v1 端点）。
+func (s *Server) adminModelTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var b struct {
+		Model string `json:"model"`
+	}
+	if json.NewDecoder(r.Body).Decode(&b) != nil || strings.TrimSpace(b.Model) == "" {
+		http.Error(w, "bad json: model required", http.StatusBadRequest)
+		return
+	}
+	acc, err := s.resolveAccount("")
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "account_error", err.Error())
+		return
+	}
+	if acc.OID == "" || acc.TID == "" {
+		if o, t := extractOIDTID(acc.AccessToken); o != "" {
+			acc.OID, acc.TID = o, t
+		}
+	}
+	if acc.OID == "" || acc.TID == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "account_error", "account missing oid/tid")
+		return
+	}
+	tone, _ := reasoningTone(b.Model, "")
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+	defer cancel()
+	res, err := s.chat.Chat(ctx, chathub.Account{AccessToken: acc.AccessToken, OID: acc.OID, TID: acc.TID}, chathub.Request{
+		Text: `Say "OK" in one word.`,
+		Tone: tone,
+	})
+	ms := time.Since(start).Milliseconds()
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "m365_error", upstreamError(err))
+		return
+	}
+	jsonOut(w, map[string]any{"ok": true, "model": b.Model, "reply": res.Text, "latency_ms": ms})
+}
+
 func (s *Server) openaiModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -767,6 +827,10 @@ type oaiReq struct {
 	ConversationID string               `json:"conversation_id"`
 	SessionID      string               `json:"session_id"`
 	SessionKey     string               `json:"session_key"`
+	// CamelCase aliases mirroring the response metadata fields; clients echo
+	// m365.conversationId / m365.sessionId back verbatim.
+	ConversationIDC string `json:"conversationId,omitempty"`
+	SessionIDC      string `json:"sessionId,omitempty"`
 	Attachments    []chathub.Attachment `json:"attachments,omitempty"`
 	Tools          []chathub.Tool       `json:"tools,omitempty"`
 	// Legacy OpenAI-compatible clients still send functions/function_call.
@@ -848,6 +912,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	normalizeLegacyTools(&body)
+	body.ConversationID = firstNonEmpty(body.ConversationID, body.ConversationIDC)
+	body.SessionID = firstNonEmpty(body.SessionID, body.SessionIDC)
 	log.Printf("[req-trace] id=%s stage=body_parsed messages=%d tools=%d choice=%s raw_bytes=%d", requestID, len(body.Messages), len(body.Tools), normalizedToolChoiceMode(body.ToolChoice), len(raw))
 	if err := validateToolConversation(body.Messages); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "tool_protocol_error", err.Error())
@@ -962,6 +1028,12 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[req-trace] id=%s stage=router_start prompt_len=%d", requestID, len(routePrompt))
 		routeRes, routeErr := s.chat.Chat(ctx, account, chathub.Request{Text: routePrompt, Tone: tone, Attachments: body.Attachments})
 		log.Printf("[req-trace] id=%s stage=router_return elapsed_ms=%d err=%t", requestID, time.Since(startedAt).Milliseconds(), routeErr != nil)
+		// Router turns run in a throwaway cloud conversation that is never
+		// reused by the answer turn; delete it so the conversation list does
+		// not accumulate one entry per routed request.
+		if routeErr == nil && routeRes.ConversationID != "" {
+			s.dropTransientConversation(routeRes.ConversationID)
+		}
 		if routeErr != nil {
 			http.Error(w, "tool router: "+routeErr.Error(), http.StatusBadGateway)
 			return
@@ -970,6 +1042,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		calls = filterCompletedCalls(calls, ledger)
 		if !parsed {
 			repairRes, repairErr := s.chat.Chat(ctx, account, chathub.Request{Text: `Repair this tool routing output into JSON only with shape {"calls":[{"name":"function_name","arguments":{}}]}. Use {"calls":[]} if no tool is needed. OUTPUT:\n` + compactToolResult(routeRes.Text, 6000), Tone: tone, Attachments: body.Attachments})
+			if repairErr == nil && repairRes.ConversationID != "" {
+				s.dropTransientConversation(repairRes.ConversationID)
+			}
 			if repairErr == nil {
 				calls, parsed = parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				calls = filterCompletedCalls(calls, ledger)
@@ -981,9 +1056,6 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				calls[i].ID = scopedCallID(calls[i].Name, string(calls[i].Arguments), i, scope)
 			}
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
-			if body.SessionKey != "" {
-				s.sessions.upsert(conversation{ID: body.SessionKey, AccountID: acc.ID, ConversationID: routeRes.ConversationID, SessionID: routeRes.SessionID, Title: prompt})
-			}
 			_ = writeToolResponse(w, "chatcmpl-"+uuid.NewString(), firstNonEmpty(body.Model, "m365-copilot"), true, calls, routeRes)
 			return
 		}
