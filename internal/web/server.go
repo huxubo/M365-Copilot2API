@@ -644,6 +644,21 @@ func modelTone(model string) string {
 	}
 }
 
+func sseRaw(ctx context.Context, w http.ResponseWriter, f http.Flusher, payload string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	if _, err := fmt.Fprint(w, payload); err != nil {
+		return err
+	}
+	if f != nil {
+		f.Flush()
+	}
+	return nil
+}
+
 func (s *Server) chatOnce(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -987,8 +1002,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "stream unsupported", http.StatusInternalServerError)
 			return
 		}
-		fmt.Fprint(w, ": connected\n\n")
-		flusher.Flush()
+		if err := sseRaw(r.Context(), w, flusher, ": connected\n\n"); err != nil {
+			return
+		}
 		var text strings.Builder
 		var pending strings.Builder
 		var streamedTools []detectedToolCall
@@ -1006,6 +1022,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 				first = false
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}}
+			rc := http.NewResponseController(w)
+			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk)); err != nil {
 				return err
 			}
@@ -1056,9 +1074,8 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		})
 		if err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			fmt.Fprint(w, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": upstreamError(err)}})+"\n\n")
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": upstreamError(err)}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 			return
 		}
 		// Some ChatHub updates contain no text event and place the completed
@@ -1085,8 +1102,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[req-trace] id=%s stage=stream_write err=%v", requestID, err)
 			return
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		if body.User != "" && res.ConversationID != "" {
 			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
@@ -1186,6 +1202,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 				delta = withRole
 			}
 			chunk := map[string]any{"id": id, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "delta": delta}}}
+			rc := http.NewResponseController(w)
+			_ = rc.SetWriteDeadline(time.Now().Add(30 * time.Second))
 			if _, err := fmt.Fprintf(w, "data: %s\n\n", mustJSON(chunk)); err != nil {
 				return err
 			}
@@ -1204,19 +1222,16 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 			return nil
 		}
-		// Commit headers immediately; the first upstream delta is then forwarded
-		// without waiting for the full ChatHub completion frame.
-		fmt.Fprintf(w, ": connected\n\n")
-		flusher.Flush()
+		if err := sseRaw(r.Context(), w, flusher, ": connected\n\n"); err != nil {
+			return
+		}
 		res, err = s.chat.ChatWithReasoning(ctx, account, answerReq, onDelta, onReasoning)
 		if err == nil {
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
-			fmt.Fprint(w, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": upstreamError(err)}})+"\n\n")
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
+			_ = sseRaw(r.Context(), w, flusher, "data: "+mustJSON(map[string]any{"error": map[string]any{"message": upstreamError(err)}})+"\n\n")
+			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		}
 	} else {
 		res, err = s.chat.Chat(ctx, account, answerReq)
@@ -1315,10 +1330,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}},
 		}
 		b, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", b)
-		flusher.Flush()
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		_ = sseRaw(r.Context(), w, flusher, "data: "+string(b)+"\n\n")
+		_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		return
 	}
 
