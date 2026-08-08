@@ -43,3 +43,6 @@ server.log
 server-error.log
 *.pid
 data-live-backup*/
+
+# Local agent memory (machine-specific notes)
+AGENTS.md
