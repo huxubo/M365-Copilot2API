@@ -84,6 +84,57 @@ type Result struct {
 	Images         []string
 }
 
+// stripThinkingTags 剥离开源对 Anthropic 系模型返回的 [analysis]/[final] 思维标记。
+// 返回 (剥离后的最终文本, analysis 内容)；无标记时原样返回。
+// 支持的格式：完整包裹 "[analysis]...[/analysis]\n\n[final]...[/final]"，
+// 或仅 analysis 块、仅 final 块、以及混合/重复块。
+func stripThinkingTags(s string) (string, string) {
+	if !strings.Contains(s, "[") {
+		return s, ""
+	}
+	var analysis []string
+	rest := s
+	// 循环提取 [analysis]...[/analysis]
+	for {
+		i := strings.Index(rest, "[analysis]")
+		if i < 0 {
+			break
+		}
+		j := strings.Index(rest[i:], "[/analysis]")
+		if j < 0 {
+			break
+		}
+		j += i + len("[/analysis]")
+		analysis = append(analysis, rest[i+len("[analysis]"):j-len("[/analysis]")])
+		rest = rest[:i] + rest[j:]
+	}
+	// 循环提取 [final]...[/final]，取最后一个块的内容
+	var lastFinal string
+	prev := rest
+	for {
+		i := strings.Index(prev, "[final]")
+		if i < 0 {
+			break
+		}
+		j := strings.Index(prev[i:], "[/final]")
+		if j < 0 {
+			break
+		}
+		j += i + len("[/final]")
+		lastFinal = prev[i+len("[final]"):j-len("[/final]")]
+		prev = prev[:i] + prev[j:]
+	}
+	out := strings.TrimSpace(prev)
+	if lastFinal != "" {
+		// [final] 是最终回复，优先采用；其余残留（如标记前的零散文本）丢弃
+		out = strings.TrimSpace(lastFinal)
+	}
+	if out == "" && strings.TrimSpace(s) != "" && len(analysis) == 0 {
+		return s, "" // 无任何标记，原样返回
+	}
+	return out, strings.TrimSpace(strings.Join(analysis, "\n"))
+}
+
 type Client struct {
 	HTTPHeader http.Header
 	HTTPClient *http.Client
@@ -387,9 +438,20 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				if text == "" {
 					text = strings.Join(deltas, "")
 				}
+				// 剥离上游对 Anthropic 系模型返回的 [analysis]/[final] 思维标记：
+				// analysis 内容并入 Reasoning（OpenAI 兼容层可渲染为 reasoning_content），
+				// 最终回复只保留 [final] 内部文本；无标记则原样返回。
+				text, analysis := stripThinkingTags(text)
+				reasoning := reasoningBuf.String()
+				if analysis != "" {
+					if reasoning != "" {
+						reasoning += "\n"
+					}
+					reasoning += analysis
+				}
 				return Result{
 					Text:           text,
-					Reasoning:      reasoningBuf.String(),
+					Reasoning:      reasoning,
 					ConversationID: req.ConversationID,
 					SessionID:      req.SessionID,
 					RequestID:      requestID,
