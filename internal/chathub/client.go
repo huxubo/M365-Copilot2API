@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
+
+// ErrRateLimitNotice identifies the human-readable rate-limit response that
+// ChatHub sometimes sends through the text channel instead of HTTP 429.
+// Callers must independently probe the account before marking it unhealthy.
+var ErrRateLimitNotice = errors.New("upstream rate-limit notice")
 
 func minInt(a, b int) int {
 	if a < b {
@@ -121,7 +127,7 @@ func stripThinkingTags(s string) (string, string) {
 			break
 		}
 		j += i + len("[/final]")
-		lastFinal = prev[i+len("[final]"):j-len("[/final]")]
+		lastFinal = prev[i+len("[final]") : j-len("[/final]")]
 		prev = prev[:i] + prev[j:]
 	}
 	out := strings.TrimSpace(prev)
@@ -276,9 +282,28 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// Only the portion not already streamed may be emitted; naive prefix
 	// checks misfire when upstream rewrites the whole buffer, which duplicated
 	// answers (AAA…). Match any overlap and emit the tail.
+	// Upstream rate limiting surfaces as a human-readable notice on the text
+	// channel instead of an HTTP 429. Detect it before any real content has
+	// streamed so the web layer can fail over rather than answer with it.
+	// The "throttling" frame itself is per-conversation quota metadata and is
+	// NOT a rate-limit signal.
+	rateLimited := func(text string) bool {
+		if streamed.Len() != 0 {
+			return false
+		}
+		t := strings.ToLower(text)
+		return strings.Contains(t, "temporarily unable to respond to this many requests") ||
+			strings.Contains(t, "太多请求") ||
+			strings.Contains(t, "无法响应这么多请求") ||
+			strings.Contains(t, "too many requests") ||
+			strings.Contains(t, "please retry") && strings.Contains(t, "later")
+	}
 	emitSnapshot := func(snapshot string) error {
 		if snapshot == "" {
 			return nil
+		}
+		if rateLimited(snapshot) {
+			return ErrRateLimitNotice
 		}
 		cur := streamed.String()
 		if cur == "" {
@@ -292,6 +317,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		}
 		if len(snapshot) > len(cur) && strings.HasSuffix(snapshot, cur) {
 			return emitDelta(snapshot[:len(snapshot)-len(cur)])
+		}
+		if len(snapshot) <= len(cur) {
+			return nil
 		}
 		return emitDelta(snapshot)
 	}
@@ -383,13 +411,13 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							toolFrame = true
 						}
 					}
+					if thr, ok := arg["throttling"]; ok {
+						throttling = thr
+					}
 					if w, ok := arg["writeAtCursor"].(string); ok && w != "" && !toolFrame {
 						if err := emitSnapshot(w); err != nil {
 							return Result{}, err
 						}
-					}
-					if thr, ok := arg["throttling"]; ok {
-						throttling = thr
 					}
 					if msgs, ok := arg["messages"].([]any); ok {
 						for _, mraw := range msgs {
@@ -423,6 +451,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						rawResult, _ = res["value"].(string)
 						if msg, ok := res["message"].(string); ok {
 							final = msg
+							if rateLimited(final) {
+								return Result{}, ErrRateLimitNotice
+							}
 						}
 					}
 				}
@@ -450,6 +481,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						reasoning += "\n"
 					}
 					reasoning += analysis
+				}
+				if rateLimited(text) {
+					return Result{}, ErrRateLimitNotice
 				}
 				return Result{
 					Text:           text,
@@ -626,7 +660,7 @@ func (c *Client) uploadAttachments(ctx context.Context, acc Account, conversatio
 }
 
 func chatPayload(text, sessionID, conversationID, requestID, tone string, firstTurn bool, attachments []Attachment, tools []Tool, toolChoice any, mcpServerURL string) string {
-	text = toolProtocolPrompt(text, tools, toolChoice)
+	text = toolProtocolPrompt(text, tools, toolChoice, len(clientPlugins(tools, mcpServerURL)) > 0)
 	message := map[string]any{
 		"author":                "user",
 		"attachments":           attachments,
@@ -695,15 +729,9 @@ func chatPayload(text, sessionID, conversationID, requestID, tone string, firstT
 		"update_textdoc_response_after_streaming",
 		"deepleo_networking_timeout_10minutes_canmore",
 		"cwc_flux_image",
-		"cwc_code_interpreter",
-		"cwc_code_interpreter_amsfix",
 		"cwcfluxgptv",
 		"flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
 		"gptvnorm2048",
-		"cwc_code_interpreter_citation_fix",
-		"code_interpreter_interactive_charts_inline_image",
-		"code_interpreter_matplotlib_patching",
-		"code_interpreter_interactive_charts",
 		"cwc_fileupload_odb",
 		"update_memory_plugin",
 		"add_custom_instructions",

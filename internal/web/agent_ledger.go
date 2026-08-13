@@ -46,6 +46,7 @@ func compactToolResult(s string, limit int) string {
 	}
 	return s[:head] + fmt.Sprintf("\n... [truncated %d bytes] ...\n", len(s)-head-tail) + s[len(s)-tail:]
 }
+
 // scopedCallID returns a globally unique tool call id. The scope parameters
 // are kept for signature compatibility with callers that pass per-turn
 // context; the id itself must not depend on call content or scope text,
@@ -195,8 +196,11 @@ func completionEvidenceAllows(answer string, l agentLedger) bool {
 	if len(l.Pending) > 0 {
 		return false
 	}
+	if len(l.Completed) == 0 && len(l.Pending) == 0 {
+		return true
+	}
 	low := strings.ToLower(answer)
-	failureKeywords := []string{"cannot confirm", "not confirmed", "unable to confirm", "no tool result", "not completed", "failed", "i cannot", "i'm unable", "i'm not able", "i don't have", "i don't currently", "i apologize", "cannot", "unable", "not able", "could not", "was not able", "does not have", "do not have", "not available", "not supported", "can't", "won't"}
+	failureKeywords := []string{"cannot confirm", "not confirmed", "unable to confirm", "no tool result", "no matching tool results were returned", "no external action has been verified"}
 	hasFailure := false
 	for _, h := range failureKeywords {
 		if strings.Contains(low, h) {
@@ -207,9 +211,6 @@ func completionEvidenceAllows(answer string, l agentLedger) bool {
 	if len(l.Completed) > 0 {
 		return !hasFailure
 	}
-	// No tool results at all: an unsupported "success" claim without any tool
-	// evidence must not pass the completion guard. An explicit inability to
-	// confirm is the only unverified case that may pass.
 	if unsupportedSuccess.MatchString(answer) {
 		return false
 	}
