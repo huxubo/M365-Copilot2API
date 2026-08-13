@@ -1427,22 +1427,62 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			_ = sseRaw(r.Context(), w, flusher, "data: [DONE]\n\n")
 		}
 	} else {
-		res, err = s.chat.Chat(ctx, account, answerReq)
-		if err != nil && body.AccountID == "" && body.ConversationID == "" && (IsRateLimited(err) || IsAuthFailure(err)) {
-			// Failover only when nothing pins the request to a conversation or
-			// account; a fresh chat can safely retry on the next healthy account.
-			next, nerr := s.nextHealthyAccount(acc.ID)
-			if nerr == nil {
-				ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
-				defer cancel2()
-				res2, err2 := s.chat.Chat(ctx2, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, answerReq)
-				if err2 == nil {
-					res = res2
-					acc = next
-					err = nil
-					s.accountPool.MarkSuccess(next.ID)
+		emptyRetry := newEmptyOutputRetry()
+		var lastErr error
+		for attempt := 0; attempt < emptyRetry.maxAttempts; attempt++ {
+			res, err = s.chat.Chat(ctx, account, answerReq)
+			if err == nil && emptyRetry.shouldRetryEmpty(res, attempt) {
+				// Upstream produced an empty generation (no text, no
+				// reasoning, no tool progress). Retry on the same account
+				// first, then fail over to the next healthy account.
+				if body.AccountID != "" || body.ConversationID != "" {
+					// Pinned request: retry once in-place only.
+					if attempt == 0 {
+						continue
+					}
+					break
 				}
+				next, nerr := s.nextHealthyAccount(acc.ID)
+				if nerr == nil {
+					ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+					account = chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}
+					acc = next
+					res, err = s.chat.Chat(ctx2, account, answerReq)
+					cancel2()
+					if err == nil && !emptyRetry.shouldRetryEmpty(res, attempt+1) {
+						s.accountPool.MarkSuccess(next.ID)
+						break
+					}
+				}
+				lastErr = fmt.Errorf("upstream returned empty output after retry")
+				continue
 			}
+			if err != nil {
+				lastErr = err
+				if body.AccountID == "" && body.ConversationID == "" && (IsRateLimited(err) || IsAuthFailure(err)) {
+					// Failover only when nothing pins the request to a
+					// conversation or account; a fresh chat can safely retry
+					// on the next healthy account.
+					next, nerr := s.nextHealthyAccount(acc.ID)
+					if nerr == nil {
+						ctx2, cancel2 := context.WithTimeout(r.Context(), time.Duration(s.settings.get().ChatTimeoutSeconds)*time.Second)
+						res2, err2 := s.chat.Chat(ctx2, chathub.Account{AccessToken: next.AccessToken, OID: next.OID, TID: next.TID}, answerReq)
+						cancel2()
+						if err2 == nil {
+							res = res2
+							acc = next
+							err = nil
+							s.accountPool.MarkSuccess(next.ID)
+							break
+						}
+					}
+				}
+				continue
+			}
+			break
+		}
+		if err != nil && lastErr != nil {
+			err = lastErr
 		}
 	}
 	if err != nil {

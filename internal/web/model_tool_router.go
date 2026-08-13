@@ -19,7 +19,9 @@ func modelToolRouterPrompt(prompt string, tools []map[string]any, choice any) st
 	if strings.Contains(prompt, "tool_calls:") || strings.Contains(prompt, "tool[call_") {
 		rules += `
 - Completed evidence must not be repeated: tool_calls/tool[call_x] rows are prior results already delivered to the user, never re-invoke them
-- Only start a new tool call when fresh unfinished work remains on the current request`
+- Only start a new tool call when fresh unfinished work remains on the current request
+- A previous call with different arguments is NOT a repeat: the same tool may be invoked again with new parameters when the task needs it
+- A failed or incomplete previous result may be retried with corrected parameters; only identical name+arguments already proven successful is forbidden`
 	}
 	return fmt.Sprintf(`You are a tool selection assistant. Based on the user request, decide which tool to call next.
 
