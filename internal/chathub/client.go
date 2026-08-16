@@ -11,6 +11,8 @@ import (
 	"m365-copilot2api/internal/outbound"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +24,28 @@ import (
 // ChatHub sometimes sends through the text channel instead of HTTP 429.
 // Callers must independently probe the account before marking it unhealthy.
 var ErrRateLimitNotice = errors.New("upstream rate-limit notice")
+
+var ErrEmptyCompletion = errors.New("upstream returned empty completion; tone may be unavailable for this tenant")
+
+// DialError carries the HTTP status and optional Retry-After from a failed
+// WebSocket dial so the web layer can route it into the correct cooldown.
+type DialError struct {
+	Status     int
+	RetryAfter int
+}
+
+func (e *DialError) Error() string {
+	return fmt.Sprintf("ws dial: upstream %d", e.Status)
+}
+
+var chTrace = os.Getenv("M365_TRACE") == "1"
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
 
 func minInt(a, b int) int {
 	if a < b {
@@ -142,21 +166,23 @@ func stripThinkingTags(s string) (string, string) {
 }
 
 type Client struct {
-	HTTPHeader http.Header
-	HTTPClient *http.Client
-	Dialer     *websocket.Dialer
-	// Trace receives attachment-only metadata; URL contents are never exposed.
-	Trace func(map[string]any)
+	HTTPHeader  http.Header
+	HTTPClient  *http.Client
+	Dialer      *websocket.Dialer
+	Preheater   *Preheater
+	Trace       func(map[string]any)
 }
 
 func NewClient() *Client {
 	h := make(http.Header)
 	h.Set("Origin", "https://m365.cloud.microsoft")
 	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) Gecko/20100101 Firefox/148.0")
+	d := outbound.WebSocketDialer()
 	return &Client{
 		HTTPHeader: h,
 		HTTPClient: outbound.HTTPClient(),
-		Dialer:     outbound.WebSocketDialer(),
+		Dialer:     d,
+		Preheater:  NewPreheater(d, h),
 	}
 }
 
@@ -220,31 +246,69 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		firstTurn = true
 	}
 	requestID := uuid.NewString()
-	if err := c.uploadAttachments(ctx, acc, req.ConversationID, req.Attachments); err != nil {
-		return Result{}, fmt.Errorf("upload attachment: %w", err)
-	}
-
 	wsURL, err := buildWSURL(acc, req.SessionID, req.ConversationID, requestID)
 	if err != nil {
 		return Result{}, err
 	}
+	attachCh := make(chan error, 1)
+	if len(req.Attachments) > 0 {
+		go func() { attachCh <- c.uploadAttachments(ctx, acc, req.ConversationID, req.Attachments) }()
+	}
 
 	dialStarted := time.Now()
-	conn, _, err := c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
-	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds())
-	if err != nil {
-		return Result{}, fmt.Errorf("ws dial: %w", err)
+	var conn *websocket.Conn
+	var reused bool
+	if c.Preheater != nil {
+		conn = c.Preheater.Take(acc.OID, acc.TID)
+		if conn != nil {
+			reused = true
+		}
 	}
+	if conn == nil {
+		var resp *http.Response
+		conn, resp, err = c.Dialer.DialContext(ctx, wsURL, c.HTTPHeader.Clone())
+		if err != nil {
+			if resp != nil && (resp.StatusCode == 429 || resp.StatusCode == 401 || resp.StatusCode == 403) {
+				retryAfter := 0
+				if v, _ := strconv.Atoi(resp.Header.Get("Retry-After")); v > 0 {
+					retryAfter = v
+				}
+				log.Printf("chathub ws_dial %d Retry-After=%d", resp.StatusCode, retryAfter)
+				return Result{}, &DialError{Status: resp.StatusCode, RetryAfter: retryAfter}
+			}
+			return Result{}, fmt.Errorf("ws dial: %w", err)
+		}
+	}
+	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d reused=%t", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds(), reused)
 	defer conn.Close()
+
+	if c.Preheater != nil {
+		go func() {
+			warmCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			warmURL, werr := buildWSURL(acc, uuid.NewString(), uuid.NewString(), uuid.NewString())
+			if werr == nil {
+				c.Preheater.Warm(warmCtx, acc.OID, acc.TID, warmURL)
+			}
+		}()
+	}
+
+	if len(req.Attachments) > 0 {
+		if attachErr := <-attachCh; attachErr != nil {
+			return Result{}, fmt.Errorf("upload attachment: %w", attachErr)
+		}
+	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
 	_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
-		return Result{}, fmt.Errorf("handshake send: %w", err)
-	}
-	if _, _, err := conn.ReadMessage(); err != nil {
-		return Result{}, fmt.Errorf("handshake recv: %w", err)
+	if !reused {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
+			return Result{}, fmt.Errorf("handshake send: %w", err)
+		}
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return Result{}, fmt.Errorf("handshake recv: %w", err)
+		}
 	}
 
 	payload := chatPayload(req.Text, req.SessionID, req.ConversationID, requestID, req.Tone, firstTurn, req.Attachments, req.Tools, req.ToolChoice, req.MCPServerURL)
@@ -267,6 +331,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	emitDelta := func(d string) error {
 		if d == "" {
 			return nil
+		}
+		if chTrace {
+			log.Printf("[trace:emitDelta] len=%d streamed=%d preview=%q", len(d), streamed.Len()+len(d), truncate(d, 80))
 		}
 		if streamed.Len() == 0 {
 			log.Printf("chathub timing first_delta_ms=%d len=%d", time.Since(payloadSentAt).Milliseconds(), len(d))
@@ -302,6 +369,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		if snapshot == "" {
 			return nil
 		}
+		if chTrace {
+			log.Printf("[trace:emitSnapshot] cur=%d snapshot=%d", streamed.Len(), len(snapshot))
+		}
 		if rateLimited(snapshot) {
 			return ErrRateLimitNotice
 		}
@@ -310,18 +380,13 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			return emitDelta(snapshot)
 		}
 		if strings.HasPrefix(snapshot, cur) {
-			return emitDelta(strings.TrimPrefix(snapshot, cur))
-		}
-		if i := strings.Index(snapshot, cur); i >= 0 {
-			return emitDelta(snapshot[i+len(cur):])
-		}
-		if len(snapshot) > len(cur) && strings.HasSuffix(snapshot, cur) {
-			return emitDelta(snapshot[:len(snapshot)-len(cur)])
+			return emitDelta(snapshot[len(cur):])
 		}
 		if len(snapshot) <= len(cur) {
 			return nil
 		}
-		return emitDelta(snapshot)
+		log.Printf("[emitSnapshot] skip: cur=%d snapshot=%d (non-prefix rewrite)", len(cur), len(snapshot))
+		return nil
 	}
 	var final string
 	var throttling any
@@ -358,6 +423,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
+			}
+			if chTrace {
+				log.Printf("[trace:ws] frame_len=%d preview=%q", len(part), truncate(part, 120))
 			}
 			events = append(events, json.RawMessage(append([]byte(nil), part...)))
 			var obj map[string]any
@@ -465,9 +533,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				if errObj, ok := obj["error"].(map[string]any); ok {
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
 				}
-				// end of stream
 				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), streamed.Len(), len(events))
-				text := final
+				text := streamed.String()
+				if text == "" {
+					text = final
+				}
 				if text == "" {
 					text = strings.Join(deltas, "")
 				}
@@ -484,6 +554,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				}
 				if rateLimited(text) {
 					return Result{}, ErrRateLimitNotice
+				}
+				if text == "" {
+					return Result{}, ErrEmptyCompletion
 				}
 				return Result{
 					Text:           text,

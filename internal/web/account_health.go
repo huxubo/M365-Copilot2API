@@ -37,6 +37,10 @@ func IsRateLimited(err error) bool {
 	if errors.As(err, &httpErr) {
 		return httpErr.Status == 429 || httpErr.Status == 503
 	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) {
+		return dialErr.Status == 429 || dialErr.Status == 503
+	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "429") ||
 		strings.Contains(msg, "too many requests") ||
@@ -54,7 +58,15 @@ func IsAuthFailure(err error) bool {
 	if errors.As(err, &httpErr) {
 		return httpErr.Status == 401 || httpErr.Status == 403
 	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) {
+		return dialErr.Status == 401 || dialErr.Status == 403
+	}
 	return false
+}
+
+func IsEmptyCompletion(err error) bool {
+	return errors.Is(err, chathub.ErrEmptyCompletion)
 }
 
 // RetryAfterSeconds returns the upstream Retry-After hint for a rate-limited
@@ -64,6 +76,10 @@ func RetryAfterSeconds(err error) int {
 	var httpErr *UpstreamHTTPError
 	if errors.As(err, &httpErr) {
 		return httpErr.RetryAfter
+	}
+	var dialErr *chathub.DialError
+	if errors.As(err, &dialErr) {
+		return dialErr.RetryAfter
 	}
 	return 0
 }
@@ -83,6 +99,8 @@ func newAccountHealth() *accountHealth {
 
 // MarkFailure records the outcome of a request for one account.
 // rateLimited cools the account down for window; authFailed pins it.
+// When the error carries an upstream Retry-After hint, that value is used
+// instead of the caller-supplied window (capped at 30 minutes).
 func (h *accountHealth) MarkFailure(accountID string, err error, window time.Duration) {
 	if window <= 0 {
 		window = 60 * time.Second
@@ -90,13 +108,24 @@ func (h *accountHealth) MarkFailure(accountID string, err error, window time.Dur
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if IsAuthFailure(err) {
-		h.authFail[accountID] = true
-		delete(h.cooldown, accountID)
+		cooldown := window
+		if cooldown > 2*time.Minute {
+			cooldown = 2 * time.Minute
+		}
+		h.cooldown[accountID] = time.Now().Add(cooldown)
+		delete(h.authFail, accountID)
 		return
 	}
 	if IsRateLimited(err) {
 		delete(h.authFail, accountID)
-		h.cooldown[accountID] = time.Now().Add(window)
+		cd := window
+		if ra := RetryAfterSeconds(err); ra > 0 {
+			cd = time.Duration(ra) * time.Second
+			if cd > 30*time.Minute {
+				cd = 30 * time.Minute
+			}
+		}
+		h.cooldown[accountID] = time.Now().Add(cd)
 	}
 }
 
@@ -138,4 +167,18 @@ func (h *accountHealth) Snapshot() map[string]map[string]any {
 		}
 	}
 	return out
+}
+
+// EarliestRecovery returns the earliest time at which any account may become
+// available again. Used to populate Retry-After when all accounts are cooling.
+func (h *accountHealth) EarliestRecovery() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	earliest := time.Now().Add(5 * time.Minute)
+	for _, until := range h.cooldown {
+		if until.Before(earliest) {
+			earliest = until
+		}
+	}
+	return earliest
 }
