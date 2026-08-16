@@ -166,11 +166,11 @@ func stripThinkingTags(s string) (string, string) {
 }
 
 type Client struct {
-	HTTPHeader  http.Header
-	HTTPClient  *http.Client
-	Dialer      *websocket.Dialer
-	Preheater   *Preheater
-	Trace       func(map[string]any)
+	HTTPHeader http.Header
+	HTTPClient *http.Client
+	Dialer     *websocket.Dialer
+	Preheater  *Preheater
+	Trace      func(map[string]any)
 }
 
 func NewClient() *Client {
@@ -182,7 +182,11 @@ func NewClient() *Client {
 		HTTPHeader: h,
 		HTTPClient: outbound.HTTPClient(),
 		Dialer:     d,
-		Preheater:  NewPreheater(d, h),
+		// Preheater disabled: reused pre-warmed connections cause the upstream
+		// Copilot service to reject tool-bearing requests ("I can't respond to
+		// this topic"). The optimization (69c8be3, 4s->180ms TTFB) is unsafe
+		// for tool calls; direct dial keeps tool routing working.
+		Preheater: nil,
 	}
 }
 
