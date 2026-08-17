@@ -25,20 +25,30 @@ import (
 )
 
 type pendingPKCE struct {
-	Verifier string
-	Created  time.Time
-	Status   string
-	Account  any
-	Error    string
+	Verifier    string
+	Created     time.Time
+	Status      string
+	Account     any
+	Error       string
+	RedirectURI string
 }
 
-// rateLimitCooldown is how long a rate-limited account stays out of rotation.
-const rateLimitCooldown = 3 * time.Minute
+const rateLimitCooldown = 30 * time.Second
 
-// maxAccountProbe bounds the round-robin walk when skipping unhealthy accounts.
 const maxAccountProbe = 16
 
 const rateLimitProbePrompt = "Reply with exactly: OK"
+
+func (s *Server) markAccountResult(accountID string, err error) {
+	if s == nil || s.accountPool == nil || accountID == "" {
+		return
+	}
+	if err != nil {
+		s.accountPool.MarkFailure(accountID, err, rateLimitCooldown)
+		return
+	}
+	s.accountPool.MarkSuccess(accountID)
+}
 
 // confirmRateLimitNotice verifies a text-channel rate-limit notice with a
 // separate, fresh ChatHub conversation. A single notice is not enough to cool
@@ -94,6 +104,7 @@ type Server struct {
 	responseMessages    map[string]map[string]respHistory
 	usage               *usageLog
 	generatedImages     map[string]generatedImage
+	convCache           *conversationCache
 }
 
 const maxResponsesPerTenant = 256
@@ -139,7 +150,17 @@ func New() (*Server, error) {
 		responseMessages:    map[string]map[string]respHistory{},
 		usage:               openUsageLog(),
 		generatedImages:     map[string]generatedImage{},
+		convCache:           newConversationCache(),
 	}, nil
+}
+
+func (s *Server) StartConvCacheGC() {
+	go func() {
+		for {
+			time.Sleep(2 * time.Minute)
+			s.convCache.GC()
+		}
+	}()
 }
 
 func (s *Server) InitM365CloudClient() {
@@ -157,6 +178,17 @@ func (s *Server) InitM365CloudClient() {
 	}
 	InitM365CloudClient(clientID, acc.TID, acc.RefreshToken)
 	log.Printf("[m365-cloud] client initialized for account %s", acc.Email)
+}
+
+func (s *Server) RefreshExpiredTokens() {
+	results := s.tokens.RefreshAllExpired()
+	for _, r := range results {
+		if r.Success {
+			log.Printf("[token-refresh] account=%s refreshed, expires=%s", r.Email, r.ExpiresAt.Format(time.RFC3339))
+		} else {
+			log.Printf("[token-refresh] account=%s failed: %s", r.Email, r.Error)
+		}
+	}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -181,6 +213,9 @@ func (s *Server) Routes() http.Handler {
 	m.HandleFunc("/api/update", s.update)
 	m.HandleFunc("/api/accounts", s.accounts)
 	m.HandleFunc("/api/accounts/refresh", s.refreshAccount)
+	m.HandleFunc("/api/accounts/schedule", s.scheduleAccount)
+	m.HandleFunc("/api/accounts/token-health", s.tokenHealth)
+	m.HandleFunc("/api/accounts/clear-cooldown", s.clearCooldown)
 	m.HandleFunc("/api/accounts/delete", s.deleteAccount)
 	m.HandleFunc("/api/accounts/provision", s.provisionAccount)
 	m.HandleFunc("/api/auth/start", s.startPKCE)
@@ -452,24 +487,41 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 	}
 	list := s.tokens.List()
 	type view struct {
-		ID          string    `json:"id"`
-		Email       string    `json:"email"`
-		DisplayName string    `json:"displayName,omitempty"`
-		Status      string    `json:"status"`
-		OID         string    `json:"oid,omitempty"`
-		TID         string    `json:"tid,omitempty"`
-		ExpiresAt   time.Time `json:"expiresAt,omitempty"`
-		UpdatedAt   time.Time `json:"updatedAt,omitempty"`
+		ID              string     `json:"id"`
+		Email           string     `json:"email"`
+		DisplayName     string     `json:"displayName,omitempty"`
+		Status          string     `json:"status"`
+		ScheduleEnabled bool       `json:"scheduleEnabled"`
+		CallCount       uint64     `json:"callCount"`
+		RateLimited     bool       `json:"rateLimited"`
+		CooldownUntil   *time.Time `json:"cooldownUntil,omitempty"`
+		OID             string     `json:"oid,omitempty"`
+		TID             string     `json:"tid,omitempty"`
+		ExpiresAt       time.Time  `json:"expiresAt,omitempty"`
+		UpdatedAt       time.Time  `json:"updatedAt,omitempty"`
 	}
 	out := make([]view, 0, len(list))
 	for _, a := range list {
+		status := a.Status
+		var cooldownUntil *time.Time
+		var callCount uint64
+		var rateLimited bool
+		if s.accountPool != nil {
+			if until, ok := s.accountPool.CooldownUntil(a.ID); ok {
+				status = "cooldown"
+				cooldownUntil = &until
+			}
+			callCount = s.accountPool.CallCount(a.ID)
+			rateLimited = s.accountPool.RateLimited(a.ID)
+		}
 		out = append(out, view{
 			ID: a.ID, Email: a.Email, DisplayName: a.DisplayName,
-			Status: a.Status, OID: a.OID, TID: a.TID,
+			Status: status, ScheduleEnabled: !a.ScheduleDisabled, CallCount: callCount, RateLimited: rateLimited,
+			CooldownUntil: cooldownUntil, OID: a.OID, TID: a.TID,
 			ExpiresAt: a.ExpiresAt, UpdatedAt: a.UpdatedAt,
 		})
 	}
-	jsonOut(w, map[string]any{"accounts": out})
+	jsonOut(w, map[string]any{"accounts": out, "health": s.accountPool.Snapshot()})
 }
 
 func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -493,6 +545,73 @@ func (s *Server) refreshAccount(w http.ResponseWriter, r *http.Request) {
 		"id": acc.ID, "email": acc.Email, "displayName": acc.DisplayName,
 		"status": acc.Status, "expiresAt": acc.ExpiresAt, "updatedAt": acc.UpdatedAt,
 	}})
+}
+
+func (s *Server) scheduleAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		ID      string `json:"id"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.ID) == "" {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if err := s.tokens.SetScheduleEnabled(strings.TrimSpace(body.ID), body.Enabled); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonOut(w, map[string]any{"status": "updated", "scheduleEnabled": body.Enabled})
+}
+
+func (s *Server) tokenHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		results := s.tokens.RefreshAllExpired()
+		refreshed, failed := 0, 0
+		for _, r := range results {
+			if r.Success {
+				refreshed++
+			} else {
+				failed++
+			}
+		}
+		jsonOut(w, map[string]any{"refreshed": refreshed, "failed": failed, "results": results})
+		return
+	}
+	list := s.tokens.List()
+	now := time.Now()
+	type entry struct {
+		ID        string    `json:"id"`
+		Email     string    `json:"email"`
+		Status    string    `json:"status"`
+		ExpiresAt time.Time `json:"expires_at"`
+		Expired   bool      `json:"expired"`
+		ExpiresIn string    `json:"expires_in"`
+	}
+	out := make([]entry, 0, len(list))
+	for _, a := range list {
+		e := entry{ID: a.ID, Email: a.Email, Status: a.Status, ExpiresAt: a.ExpiresAt}
+		if now.After(a.ExpiresAt) {
+			e.Expired = true
+			e.ExpiresIn = "expired"
+		} else {
+			e.ExpiresIn = a.ExpiresAt.Sub(now).Truncate(time.Second).String()
+		}
+		out = append(out, e)
+	}
+	jsonOut(w, map[string]any{"accounts": out, "now": now.Format(time.RFC3339)})
+}
+
+func (s *Server) clearCooldown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.accountPool.ClearAllCooldowns()
+	jsonOut(w, map[string]any{"status": "ok"})
 }
 
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
@@ -561,7 +680,7 @@ func (s *Server) startPKCE(w http.ResponseWriter, _ *http.Request) {
 	state := hex.EncodeToString(b)
 	redirectURI := auth.RedirectURI()
 	s.mu.Lock()
-	s.pkce[state] = pendingPKCE{Verifier: v, Created: time.Now(), Status: "pending"}
+	s.pkce[state] = pendingPKCE{Verifier: v, Created: time.Now(), Status: "pending", RedirectURI: redirectURI}
 	s.mu.Unlock()
 	jsonOut(w, map[string]string{
 		"status": "pkce_ready",
@@ -609,30 +728,58 @@ func (s *Server) pkceStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	code := r.URL.Query().Get("code")
+	oauthError := r.URL.Query().Get("error")
 	// also accept pasted full callback URL
-	if code == "" {
+	if code == "" && oauthError == "" {
 		if u := r.URL.Query().Get("url"); u != "" {
 			if parsed, err := http.NewRequest(http.MethodGet, u, nil); err == nil {
 				code = parsed.URL.Query().Get("code")
+				oauthError = parsed.URL.Query().Get("error")
 				if state == "" {
 					state = parsed.URL.Query().Get("state")
 				}
 			}
 		}
 	}
-	if state == "" || code == "" {
-		http.Error(w, "missing state or code", http.StatusBadRequest)
+	if state == "" || (code == "" && oauthError == "") {
+		http.Error(w, "missing state or authorization result", http.StatusBadRequest)
 		return
 	}
 	s.mu.Lock()
 	p, ok := s.pkce[state]
-	s.mu.Unlock()
 	if !ok || time.Since(p.Created) > 10*time.Minute {
+		if ok {
+			delete(s.pkce, state)
+		}
+		s.mu.Unlock()
 		http.Error(w, "invalid or expired state", http.StatusBadRequest)
 		return
 	}
-	tok, err := auth.ExchangeCode(code, p.Verifier, auth.RedirectURI())
+	if p.Status != "pending" {
+		s.mu.Unlock()
+		http.Error(w, "authorization result already consumed", http.StatusConflict)
+		return
+	}
+	p.Status = "processing"
+	s.pkce[state] = p
+	s.mu.Unlock()
+	if oauthError != "" {
+		log.Printf("oauth_error stage=callback error=%q", oauthError)
+		s.mu.Lock()
+		p.Status = "error"
+		p.Error = oauthError
+		s.pkce[state] = p
+		s.mu.Unlock()
+		http.Error(w, "Microsoft authorization failed: "+oauthError, http.StatusBadRequest)
+		return
+	}
+	redirectURI := p.RedirectURI
+	if redirectURI == "" {
+		redirectURI = auth.RedirectURI()
+	}
+	tok, err := auth.ExchangeCode(code, p.Verifier, redirectURI)
 	if err != nil {
+		logOAuthError("code_exchange", err)
 		s.mu.Lock()
 		p.Status = "error"
 		p.Error = err.Error()
@@ -658,7 +805,7 @@ func (s *Server) callbackPKCE(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	// Browser loopback callbacks should finish in a friendly page instead of
 	// displaying a raw JSON response. Keep JSON for the manual/API flow.
-	if strings.HasPrefix(auth.RedirectURI(), "http://127.0.0.1:") || strings.HasPrefix(auth.RedirectURI(), "http://localhost:") {
+	if strings.HasPrefix(redirectURI, "http://127.0.0.1:") || strings.HasPrefix(redirectURI, "http://localhost:") {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, `<!doctype html><meta charset="utf-8"><title>M365 Copilot2API 授权完成</title><style>body{font:16px system-ui;text-align:center;padding:15vh 20px;color:#242424}main{max-width:520px;margin:auto}h1{font-size:26px}</style><main><h1>授权完成</h1><p>账号已经自动加入账号池，可以关闭此页面。</p><script>if(window.opener){window.opener.postMessage({type:"m365-auth-complete"},window.location.origin);setTimeout(()=>window.close(),300)}</script></main>`)
 		return
@@ -682,6 +829,9 @@ func (s *Server) resolveAccount(accountID string) (auth.AccountToken, error) {
 				break
 			}
 			accountID = acc.ID
+		}
+		if !s.tokens.ScheduleEnabled(accountID) {
+			return auth.AccountToken{}, fmt.Errorf("no accounts enabled for scheduling")
 		}
 		if !s.accountPool.Available(accountID) {
 			until := s.accountPool.EarliestRecovery()
@@ -764,22 +914,6 @@ func modelTone(model string) string {
 		return "Claude_Sonnet"
 	case "claude-sonnet-reasoning":
 		return "Claude_Sonnet_Reasoning"
-	case "claude-opus-4-8":
-		return "Claude_Opus_4_8"
-	case "claude-opus-4-8-reasoning":
-		return "Claude_Opus_4_8_Reasoning"
-	case "claude-sonnet-4-6":
-		return "Claude_Sonnet_4_6"
-	case "claude-sonnet-4-6-reasoning":
-		return "Claude_Sonnet_4_6_Reasoning"
-	case "claude-opus-4-6":
-		return "Claude_Opus_4_6"
-	case "claude-opus-4-6-reasoning":
-		return "Claude_Opus_4_6_Reasoning"
-	case "claude-fable-5":
-		return "Claude_Fable_5"
-	case "claude-fable-5-reasoning":
-		return "Claude_Fable_5_Reasoning"
 	case "gpt-5.4-quick":
 		return "Gpt_5_4_Chat"
 	case "gpt-5.3-think-deeper":
@@ -1207,6 +1341,33 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Conversation cache: reuse existing M365 conversation for same account+model
+	// to avoid re-processing full system prompt + history each request (latency
+	// drops from 3-5s to ~1s). Only kicks in when no explicit conversation ID
+	// was provided by client, session key, user session, or session resolver.
+	convReused := false
+	convCacheModel := firstNonEmpty(body.Model, "m365-copilot")
+	if body.ConversationID == "" && len(body.Messages) > 1 {
+		sysHash := systemPromptHash(body.Messages)
+		if cached := s.convCache.Lookup(acc.ID, convCacheModel); cached != nil && cached.SystemPrompt == sysHash {
+			if len(body.Messages) > cached.MessageCount {
+				incPrompt, incAtt := flattenPromptMessages(body.Messages[cached.MessageCount:], nil)
+				incPrompt = strings.TrimSpace(incPrompt)
+				if incPrompt != "" {
+					body.ConversationID = cached.ConversationID
+					body.SessionID = cached.SessionID
+					answerPrompt = incPrompt
+					body.Attachments = incAtt
+					convReused = true
+					log.Printf("[conv-cache] hit account=%s model=%s conversation=%s cached_msgs=%d new_msgs=%d", acc.ID, convCacheModel, cached.ConversationID, cached.MessageCount, len(body.Messages))
+				}
+			}
+		}
+	}
+	if !convReused && body.ConversationID == "" {
+		log.Printf("[conv-cache] miss account=%s model=%s", acc.ID, convCacheModel)
+	}
+
 	// Normalize tools once. Selection is always made by the upstream model;
 	// the gateway only validates its structured decision and converts protocols.
 	toolMaps := make([]map[string]any, 0, len(body.Tools))
@@ -1437,6 +1598,9 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
+			if convReused {
+				s.invalidateConvCache(acc.ID, convCacheModel)
+			}
 			msg := upstreamError(err)
 			if IsRateLimited(err) {
 				msg = "upstream is rate limiting; try again shortly"
@@ -1463,7 +1627,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			// to exactly one of the tools the client actually declared.
 			repairPrompt := modelToolRouterPrompt(prompt+"\n"+ledger.RouterContext(), toolMaps, "required") +
 				"\nREPAIR RULE: The previous upstream event selected an undeclared tool. Select one declared tool that performs the intended operation. Never return unknown_tool."
-			repairRes, repairErr := s.chat.Chat(ctx, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments})
+			repairRes, repairErr := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: repairPrompt, Tone: tone, Attachments: body.Attachments})
 			if repairErr == nil {
 				repaired, parsed := parseModelToolDecision(repairRes.Text, toolMaps, body.ToolChoice)
 				if parsed {
@@ -1481,13 +1645,20 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if len(calls) > 0 {
-			log.Printf("[req-trace] id=%s stage=tool_calls_detected count=%d names=%v", requestID, len(calls), func() []string { var n []string; for _, c := range calls { n = append(n, c.Name) }; return n }())
+			log.Printf("[req-trace] id=%s stage=tool_calls_detected count=%d names=%v", requestID, len(calls), func() []string {
+				var n []string
+				for _, c := range calls {
+					n = append(n, c.Name)
+				}
+				return n
+			}())
 			calls = limitToolCalls(calls, adaptiveToolCallLimit(calls, configuredToolCallLimit(s.settings)))
 			_ = writeToolResponse(w, id, model, true, calls, toolResult)
 			if body.User != "" && res.ConversationID != "" {
 				s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 			}
 			s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
+			s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 			return
 		}
 		if err := emitText(pending.String()); err != nil {
@@ -1501,6 +1672,7 @@ func (s *Server) openaiChat(w http.ResponseWriter, r *http.Request) {
 			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, answerPrompt, startedAt)
+		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 	// Ask the upstream model to select and validate the next tool. The gateway
@@ -1678,6 +1850,9 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 		} else {
 			log.Printf("[req-trace] id=%s stage=stream_error err=%v", requestID, err)
 			s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
+			if convReused {
+				s.invalidateConvCache(acc.ID, convCacheModel)
+			}
 			msg := upstreamError(err)
 			if IsRateLimited(err) {
 				msg = "upstream is rate limiting; try again shortly"
@@ -1735,6 +1910,10 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	if err != nil {
 		s.accountPool.MarkFailure(acc.ID, err, rateLimitCooldown)
+		if convReused {
+			s.invalidateConvCache(acc.ID, convCacheModel)
+			log.Printf("[conv-cache] invalidated account=%s model=%s after error: %v", acc.ID, convCacheModel, err)
+		}
 		writeUpstreamError(w, err)
 		return
 	}
@@ -1744,6 +1923,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			s.userSessions.Put(body.User, res.ConversationID, res.SessionID, acc.ID)
 		}
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
+		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 		return
 	}
 
@@ -1756,6 +1936,7 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	if res.ConversationID != "" {
 		s.bindConversation(acc, &body, r, res, prompt, startedAt)
+		s.storeConvCache(acc.ID, convCacheModel, res, tone, body.Messages, convReused)
 	}
 	if res.ConversationID != "" {
 		resolved := s.sessionResolver.Resolve(r, &body)
@@ -1778,8 +1959,8 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 	}
 	if len(toolMaps) > 0 && isSandboxHallucination(res.Text) {
 		log.Printf("[sandbox-eject] model used code interpreter/sandbox, retrying with explicit tool instruction")
-		correction := "CRITICAL: You must NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. The caller has provided a bash tool that runs Windows PowerShell 5.1 on their local machine — use it to execute any commands or code. Do NOT say you cannot run code. Do NOT say you only have a Linux container. Call the bash tool NOW with the appropriate command.\n\nUser request:\n" + prompt
-		res2, err2 := s.chat.Chat(ctx, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments})
+		correction := "CRITICAL: You must NOT use any built-in code interpreter, Python sandbox, or cloud execution environment. The caller has provided a bash tool that runs Windows PowerShell 5.1 on their local machine — use it to execute any commands or code. Do NOT say you cannot run code. Do NOT say you only have a Linux container. Do NOT say you have no Windows execution channel. You DO have a bash tool that runs on Windows. Call the bash tool NOW with the appropriate PowerShell command.\n\nUser request:\n" + prompt
+		res2, err2 := s.chatWithAccount(ctx, acc.ID, account, chathub.Request{Text: correction, Tone: tone, Attachments: body.Attachments})
 		if err2 == nil && !isSandboxHallucination(res2.Text) {
 			res = res2
 		}
@@ -1828,7 +2009,12 @@ APPLICATION_REQUEST_AND_EVIDENCE:
 			}
 		}
 	}
-	if !completionEvidenceAllows(res.Text, ledger) {
+	if isContentPolicyBlock(res.Text) {
+		log.Printf("[content-policy] M365 blocked the request, returning 503")
+		writeOpenAIError(w, http.StatusServiceUnavailable, "upstream_content_blocked", "M365 content policy blocked this request; try again or switch account")
+		return
+	}
+	if len(toolMaps) > 0 && !completionEvidenceAllows(res.Text, ledger) {
 		res.Text = "I cannot confirm completion because no matching tool results were returned. No external action has been verified."
 	}
 	res.Text = sanitizePublicAssistantTextForModel(res.Text, body.Model)

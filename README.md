@@ -1,7 +1,5 @@
 # M365 Copilot2API
 
-> 本 README 为项目主文档，使用中文维护。Web 控制台的中英文 i18n 仅用于控制台界面语言切换。
-
 <p align="center">
   <img src="https://img.shields.io/github/license/HEXUXIU/M365-Copilot2API" alt="License">
   <img src="https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go" alt="Go Version">
@@ -92,6 +90,27 @@ M365 Copilot2API 是一个用 Go 编写的自托管网关，把微软 365 Copilo
 - Go 1.23+（`go.mod` 声明的最低版本）
 - Windows / Linux 均可；Windows 上推荐用仓库自带的 `manage.py` 管理生命周期
 
+### 预编译二进制（推荐）
+
+从 [GitHub Releases](https://github.com/HEXUXIU/M365-Copilot2API/releases) 下载对应平台的二进制：
+
+| 平台 | 架构 | 文件 |
+|------|------|------|
+| Linux | x86_64 / arm64 / i386 | `m365-copilot2api-linux-{amd64,arm64,386}` |
+| Windows | x86_64 / arm64 / i386 | `m365-copilot2api-windows-{amd64,arm64,386}.exe` |
+| macOS | x86_64 / arm64 | `m365-copilot2api-darwin-{amd64,arm64}` |
+
+```bash
+# Linux / macOS 示例
+chmod +x m365-copilot2api-linux-amd64
+./m365-copilot2api-linux-amd64
+```
+
+```powershell
+# Windows 示例
+.\m365-copilot2api-windows-amd64.exe
+```
+
 ### 源码编译
 
 ```powershell
@@ -128,7 +147,7 @@ python manage.py stop     # 停止服务
 
 ### Docker 部署
 
-> 由于个人精力有限且不做容器化维护，官方停止提供 Dockerfile / docker-compose 部署。需要容器部署的用户请自行根据原生环境打包，或在 Discussions 交流社区自建的 Docker 方案。
+> 官方不提供 Dockerfile。如需容器化部署，可自行基于预编译二进制或源码构建镜像，或在 Discussions 交流社区方案。
 
 ### 初始化与第一次调用
 
@@ -202,22 +221,9 @@ python manage.py stop     # 停止服务
 | `M365_PROXY_POOL` | 空 | 代理列表（逗号或换行分隔，支持 http / https / socks5） |
 | `M365_PROXY_INSECURE_TLS` | — | 信任自签代理证书（`1` / `true`） |
 | `M365_PROXY_HEALTH_URL` | 默认探测地址 | 代理健康检查目标 |
-| `M365_CLIENT_ID` | 内置 | Azure 应用 Client ID |
-| `M365_AUTHORITY` / `M365_REDIRECT_URI` / `M365_SCOPE` | 内置 | OAuth 端点自定义覆盖 |
-| `M365_BROWSER_CLIENT_ID` / `M365_BROWSER_AUTHORITY` / `M365_BROWSER_REDIRECT_URI` / `M365_BROWSER_SCOPE` | 内置 | 仅用于浏览器 PKCE 的 OAuth 配置；authority 可使用 `common`、`organizations` 或 `consumers` |
-| `M365_DEVICE_CLIENT_ID` / `M365_DEVICE_AUTHORITY` / `M365_DEVICE_SCOPE` | 内置 | 仅用于 Device Code 的 OAuth 配置 |
-
-Loopback 回调需显式启用。请先在 Azure 应用注册中登记完全一致的 loopback URI，例如 `http://127.0.0.1:4141/api/auth/callback`，再同时设置 `M365_BROWSER_CLIENT_ID` 和 `M365_BROWSER_REDIRECT_URI`。内置第一方客户端可能会因 loopback URI 未注册而返回 `AADSTS50011`，因此默认仍使用兼容性更好的 `nativeclient` 重定向，并由用户手动粘贴回调 URL。
-
-选择 `common`、`organizations` 或 `consumers` 只会控制 Microsoft 可提供的账号类别，不会绕过 Microsoft 身份验证、多重身份验证（MFA）、租户策略、账号类型限制、授权同意、许可证或服务资格检查。自定义 Client ID 不保证能够访问私有 Substrate scope；个人 Microsoft 账号成功登录也不代表该账号具备 M365 Copilot 服务资格。
-
-### 工具与网络搜索
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `M365_ENABLE_WEB_SEARCH` | 开 | 自动注入 `web_search` 声明（`0` / `false` / `off` 关闭）。开启后每次对话都会像 M365 网页版那样注册 BingWebSearch 内建插件，模型可基于实时搜索结果作答 |
-
-> 说明：`web_search` 是服务端内建工具（`BingWebSearch`），不会出现在下发给客户端的 `tool_calls` 里；搜索结果以 `SearchResults` 引用形式出现在回答流中。客户端若要自行声明 `web_search`（type 或 function name），网关不会重复注入。
+| `M365_BROWSER_CLIENT_ID` / `M365_BROWSER_AUTHORITY` / `M365_BROWSER_REDIRECT_URI` / `M365_BROWSER_SCOPE` | 内置 | 浏览器 PKCE 的 OAuth 配置 |
+| `M365_DEVICE_CLIENT_ID` / `M365_DEVICE_AUTHORITY` / `M365_DEVICE_SCOPE` | 内置 | Device Code 的 OAuth 配置 |
+| `M365_CLIENT_ID` / `M365_AUTHORITY` / `M365_REDIRECT_URI` / `M365_SCOPE` | 内置 | 兼容旧配置；流程专用变量未设置时作为回退 |
 
 ### 数据文件
 
@@ -328,23 +334,17 @@ curl http://127.0.0.1:4141/v1/messages \
 
 ## 可用模型
 
-网关实际内置 13 个模型（`gatewayModels` + 默认映射，以 `/v1/models` 目录为准；可在控制台「设置」页增删映射、调整默认推理级别）：
+网关默认内置模型映射（可在控制台「设置」页增删与调整默认推理级别）：
 
 | 模型 | 默认推理级别 | 说明 |
 |------|-------------|------|
-| `gpt-5.6-sol` | `low` | 默认模型（可配置映射） |
-| `gpt-5.6-terra` | `medium` | 推理折中（可配置映射） |
-| `gpt-5.6-luna` | `medium` | 推理折中（可配置映射） |
-| `gpt-5.6-reasoning` | — | 内置模型 |
-| `gpt-5.5` / `gpt-5.5-reasoning` | — | 内置模型 |
-| `gpt-5.4` / `gpt-5.4-reasoning` | — | 内置模型 |
-| `gpt-5.3` | — | 内置模型 |
-| `gpt-5.2` / `gpt-5.2-reasoning` | — | 内置模型 |
-| `claude-sonnet` / `claude-sonnet-reasoning` | — | 内置模型（Anthropic via M365） |
+| `gpt-5.6-sol` | `low` | 默认模型 |
+| `gpt-5.6-terra` | `medium` | 推理折中 |
+| `gpt-5.6-luna` | `medium` | 推理折中 |
 
 - 模型映射把公开模型名翻译成上游 tone；控制台可增删映射、调整默认推理级别。
 - 推理强度还可通过请求内的 `reasoning_effort` 参数调整。
-- 内置模型来自 `internal/web/codex_catalog.go`（`gatewayModels`），可配置映射来自 `internal/web/settings.go`（`defaultModelMappings`）；M365 订阅上线的新模型（如 `codex` 系）以实际目录为准，可在控制台配置导入。
+- M365 订阅会上线的新模型名（如 `gpt-5.2`、`gpt-5.4`、`codex` 系）以实际目录为准，可在控制台配置导入。
 
 ## 内容键会话复用原理
 

@@ -114,62 +114,11 @@ type Result struct {
 	Images         []string
 }
 
-// stripThinkingTags 剥离开源对 Anthropic 系模型返回的 [analysis]/[final] 思维标记。
-// 返回 (剥离后的最终文本, analysis 内容)；无标记时原样返回。
-// 支持的格式：完整包裹 "[analysis]...[/analysis]\n\n[final]...[/final]"，
-// 或仅 analysis 块、仅 final 块、以及混合/重复块。
-func stripThinkingTags(s string) (string, string) {
-	if !strings.Contains(s, "[") {
-		return s, ""
-	}
-	var analysis []string
-	rest := s
-	// 循环提取 [analysis]...[/analysis]
-	for {
-		i := strings.Index(rest, "[analysis]")
-		if i < 0 {
-			break
-		}
-		j := strings.Index(rest[i:], "[/analysis]")
-		if j < 0 {
-			break
-		}
-		j += i + len("[/analysis]")
-		analysis = append(analysis, rest[i+len("[analysis]"):j-len("[/analysis]")])
-		rest = rest[:i] + rest[j:]
-	}
-	// 循环提取 [final]...[/final]，取最后一个块的内容
-	var lastFinal string
-	prev := rest
-	for {
-		i := strings.Index(prev, "[final]")
-		if i < 0 {
-			break
-		}
-		j := strings.Index(prev[i:], "[/final]")
-		if j < 0 {
-			break
-		}
-		j += i + len("[/final]")
-		lastFinal = prev[i+len("[final]") : j-len("[/final]")]
-		prev = prev[:i] + prev[j:]
-	}
-	out := strings.TrimSpace(prev)
-	if lastFinal != "" {
-		// [final] 是最终回复，优先采用；其余残留（如标记前的零散文本）丢弃
-		out = strings.TrimSpace(lastFinal)
-	}
-	if out == "" && strings.TrimSpace(s) != "" && len(analysis) == 0 {
-		return s, "" // 无任何标记，原样返回
-	}
-	return out, strings.TrimSpace(strings.Join(analysis, "\n"))
-}
-
 type Client struct {
 	HTTPHeader http.Header
 	HTTPClient *http.Client
 	Dialer     *websocket.Dialer
-	Preheater  *Preheater
+	Pool       *ConnPool
 	Trace      func(map[string]any)
 }
 
@@ -182,11 +131,7 @@ func NewClient() *Client {
 		HTTPHeader: h,
 		HTTPClient: outbound.HTTPClient(),
 		Dialer:     d,
-		// Preheater disabled: reused pre-warmed connections cause the upstream
-		// Copilot service to reject tool-bearing requests ("I can't respond to
-		// this topic"). The optimization (69c8be3, 4s->180ms TTFB) is unsafe
-		// for tool calls; direct dial keeps tool routing working.
-		Preheater: nil,
+		Pool:       NewConnPool(d, h),
 	}
 }
 
@@ -262,10 +207,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	dialStarted := time.Now()
 	var conn *websocket.Conn
 	var reused bool
-	if c.Preheater != nil {
-		conn = c.Preheater.Take(acc.OID, acc.TID)
-		if conn != nil {
-			reused = true
+	if c.Pool != nil {
+		var poolErr error
+		conn, reused, poolErr = c.Pool.Take(ctx, acc.OID, acc.TID, wsURL)
+		if poolErr != nil {
+			return Result{}, fmt.Errorf("ws dial: %w", poolErr)
 		}
 	}
 	if conn == nil {
@@ -284,21 +230,21 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		}
 	}
 	log.Printf("chathub timing ws_dial_ms=%d total_ms=%d reused=%t", time.Since(dialStarted).Milliseconds(), time.Since(startedAt).Milliseconds(), reused)
-	defer conn.Close()
 
-	if c.Preheater != nil {
-		go func() {
-			warmCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			warmURL, werr := buildWSURL(acc, uuid.NewString(), uuid.NewString(), uuid.NewString())
-			if werr == nil {
-				c.Preheater.Warm(warmCtx, acc.OID, acc.TID, warmURL)
-			}
-		}()
-	}
+	returnConn := true
+	defer func() {
+		if returnConn && conn != nil && c.Pool != nil {
+			_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.Pool.Return(acc.OID, acc.TID, conn)
+		} else if conn != nil {
+			conn.Close()
+		}
+	}()
 
 	if len(req.Attachments) > 0 {
 		if attachErr := <-attachCh; attachErr != nil {
+			returnConn = false
 			return Result{}, fmt.Errorf("upload attachment: %w", attachErr)
 		}
 	}
@@ -308,9 +254,11 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 	if !reused {
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"protocol":"json","version":1}`+rs)); err != nil {
+			returnConn = false
 			return Result{}, fmt.Errorf("handshake send: %w", err)
 		}
 		if _, _, err := conn.ReadMessage(); err != nil {
+			returnConn = false
 			return Result{}, fmt.Errorf("handshake recv: %w", err)
 		}
 	}
@@ -327,6 +275,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	log.Printf("chathub timing handshake_ms=%d", time.Since(dialStarted).Milliseconds())
 	payloadSentAt := time.Now()
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		returnConn = false
 		return Result{}, fmt.Errorf("chat send: %w", err)
 	}
 
@@ -415,10 +364,12 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 		var read wsRead
 		select {
 		case <-ctx.Done():
+			returnConn = false
 			return Result{}, ctx.Err()
 		case read = <-readCh:
 		}
 		if read.err != nil {
+			returnConn = false
 			// Never convert a timeout or dropped WebSocket into a successful
 			// partial response. A response is complete only after SignalR type 3.
 			return Result{}, fmt.Errorf("ws read before completion: %w", read.err)
@@ -431,9 +382,10 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 			if chTrace {
 				log.Printf("[trace:ws] frame_len=%d preview=%q", len(part), truncate(part, 120))
 			}
-			events = append(events, json.RawMessage(append([]byte(nil), part...)))
+			b := []byte(part)
+			events = append(events, json.RawMessage(b))
 			var obj map[string]any
-			if err := json.Unmarshal([]byte(part), &obj); err != nil {
+			if err := json.Unmarshal(b, &obj); err != nil {
 				continue
 			}
 			t, _ := obj["type"].(float64)
@@ -456,6 +408,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					if onEvent != nil {
 						for _, ev := range extractToolEvents(arg, seenStreamTools) {
 							if err := onEvent(ev); err != nil {
+								returnConn = false
 								return Result{}, err
 							}
 						}
@@ -466,10 +419,9 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 							reasoningBuf.WriteString(ev.Text)
 						}
 						ev.Raw = eventRaw(arg)
-						// SearchResults frames carry live citations; surface them to
-						// handlers even though they are classified as text.
-						if (ev.Kind != "text" || ev.ContentType == "SearchResults") && onEvent != nil {
+						if ev.Kind != "text" && onEvent != nil {
 							if err := onEvent(ev); err != nil {
+								returnConn = false
 								return Result{}, err
 							}
 						}
@@ -488,6 +440,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 					}
 					if w, ok := arg["writeAtCursor"].(string); ok && w != "" && !toolFrame {
 						if err := emitSnapshot(w); err != nil {
+							returnConn = false
 							return Result{}, err
 						}
 					}
@@ -504,6 +457,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 								// ChatHub often sends the first visible text as a full snapshot,
 								// followed by cursor deltas. Emit only the unseen suffix.
 								if err := emitSnapshot(text); err != nil {
+									returnConn = false
 									return Result{}, err
 								}
 							}
@@ -524,6 +478,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 						if msg, ok := res["message"].(string); ok {
 							final = msg
 							if rateLimited(final) {
+								returnConn = false
 								return Result{}, ErrRateLimitNotice
 							}
 						}
@@ -535,6 +490,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 
 			if int(t) == 3 {
 				if errObj, ok := obj["error"].(map[string]any); ok {
+					returnConn = false
 					return Result{}, fmt.Errorf("chathub completion error: %v", errObj)
 				}
 				log.Printf("chathub timing completion_frame_ms=%d streamed_text=%d events=%d", time.Since(payloadSentAt).Milliseconds(), streamed.Len(), len(events))
@@ -545,26 +501,17 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 				if text == "" {
 					text = strings.Join(deltas, "")
 				}
-				// 剥离上游对 Anthropic 系模型返回的 [analysis]/[final] 思维标记：
-				// analysis 内容并入 Reasoning（OpenAI 兼容层可渲染为 reasoning_content），
-				// 最终回复只保留 [final] 内部文本；无标记则原样返回。
-				text, analysis := stripThinkingTags(text)
-				reasoning := reasoningBuf.String()
-				if analysis != "" {
-					if reasoning != "" {
-						reasoning += "\n"
-					}
-					reasoning += analysis
-				}
 				if rateLimited(text) {
+					returnConn = false
 					return Result{}, ErrRateLimitNotice
 				}
 				if text == "" {
+					returnConn = false
 					return Result{}, ErrEmptyCompletion
 				}
 				return Result{
 					Text:           text,
-					Reasoning:      reasoning,
+					Reasoning:      reasoningBuf.String(),
 					ConversationID: req.ConversationID,
 					SessionID:      req.SessionID,
 					RequestID:      requestID,
@@ -581,6 +528,7 @@ func (c *Client) chatWithHandlers(ctx context.Context, acc Account, req Request,
 	// Reaching the overall deadline without a SignalR completion frame is
 	// an incomplete upstream response. Do not return accumulated deltas as if
 	// they were a successful, finished answer.
+	returnConn = false
 	return Result{}, fmt.Errorf("chathub response deadline exceeded before completion")
 }
 

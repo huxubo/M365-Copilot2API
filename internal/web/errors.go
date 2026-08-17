@@ -15,7 +15,7 @@ func logOAuthError(stage string, err error) {
 		log.Printf("oauth_error stage=%s error=%q aadsts=%q http_status=%d correlation_id=%q trace_id=%q", stage, oauthErr.Code, oauthErr.AADSTS, oauthErr.HTTPStatus, oauthErr.CorrelationID, oauthErr.TraceID)
 		return
 	}
-	log.Printf("oauth_error stage=%s error=%v", stage, err)
+	log.Printf("oauth_error stage=%s error=%q", stage, "request_failed")
 }
 
 // upstreamError keeps transport details, including URLs and credentials, out
