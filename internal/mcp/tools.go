@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -10,6 +11,25 @@ type Tool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description,omitempty"`
 	InputSchema map[string]any `json:"inputSchema,omitempty"`
+}
+
+type Resource struct {
+	URI         string `json:"uri"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	MIMEType    string `json:"mimeType,omitempty"`
+}
+
+type ResourceContent struct {
+	URI      string `json:"uri"`
+	MIMEType string `json:"mimeType,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Blob     []byte `json:"blob,omitempty"`
+}
+
+type ResourceProvider interface {
+	ListResources(ctx context.Context) ([]Resource, error)
+	ReadResource(ctx context.Context, uri string) (ResourceContent, error)
 }
 
 type CallResult struct {
@@ -27,6 +47,20 @@ func (c *ToolCache) Replace(tools []Tool) {
 	copyTools := append([]Tool(nil), tools...)
 	c.mu.Lock()
 	c.tools = copyTools
+	c.mu.Unlock()
+}
+
+func (c *ToolCache) Merge(tools []Tool) {
+	c.mu.Lock()
+	existing := map[string]bool{}
+	for _, t := range c.tools {
+		existing[t.Name] = true
+	}
+	for _, t := range tools {
+		if !existing[t.Name] {
+			c.tools = append(c.tools, t)
+		}
+	}
 	c.mu.Unlock()
 }
 

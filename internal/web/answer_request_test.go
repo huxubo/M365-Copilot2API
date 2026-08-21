@@ -25,8 +25,11 @@ func TestBuildAnswerRequestRouterOmitsNativePlugins(t *testing.T) {
 	if len(req.Tools) != 0 || req.ToolChoice != nil {
 		t.Fatalf("router answer leaked native tools: tools=%d choice=%#v", len(req.Tools), req.ToolChoice)
 	}
-	if req.Text != "[user]\nhello" {
-		t.Fatalf("empty ledger changed answer prompt: %q", req.Text)
+	if !strings.Contains(req.Text, "[user]\nhello") {
+		t.Fatalf("answer prompt lost original text: %q", req.Text)
+	}
+	if !strings.Contains(req.Text, "PARTIAL COMPLETION") {
+		t.Fatalf("answer prompt missing behavior directive")
 	}
 }
 
